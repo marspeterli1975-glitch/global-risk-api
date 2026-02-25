@@ -4,13 +4,11 @@ from pydantic import BaseModel
 import os
 import openai
 
-# Read OpenAI key from environment variables (Render Environment Variables)
-openai.api_key = os.getenv("OPENAI_API_KEY")
-
+# ===== App =====
 app = FastAPI(title="Global Risk API", version="1.0.0")
 
-# ✅ CORS: allow Hoppscotch / browser calls (for testing, allow all)
-# After it works, you can restrict allow_origins to specific domains.
+# ===== CORS (Hoppscotch / Browser needs this) =====
+# 最宽松写法：允许任意来源。后续你要上线再收紧到指定域名。
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -19,10 +17,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ===== OpenAI Key =====
+openai.api_key = os.getenv("OPENAI_API_KEY")
+
 
 class RiskRequest(BaseModel):
     location: str
-    language: str = "en"  # "en" or "zh"
+    language: str = "en"
 
 
 @app.get("/")
@@ -32,59 +33,60 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"status": "healthy"}
+    return {"status": "ok"}
 
 
 @app.post("/analyze")
 async def analyze_risk(request: RiskRequest):
+    # 1) Key 检查：不给 500“黑盒”，直接告诉你缺什么
     if not openai.api_key:
         raise HTTPException(
             status_code=500,
-            detail="OPENAI_API_KEY is not set in environment variables.",
+            detail="OPENAI_API_KEY is not set on the server. Please add it in Render -> Settings -> Environment.",
         )
 
+    # 2) Prompt
     prompt_en = f"""
-You are a risk analyst.
 Provide a structured global risk analysis for: {request.location}
 
-Output format:
-1) Overall risk level: Low/Medium/High (one line)
-2) Key risks (bullet list, 6-10 items)
-3) Category breakdown (Weather / Political / Military / Public Security / Health / Transport) - short bullets
-4) Practical safety advice (5-8 bullets)
-5) Confidence & data limitations (2-4 bullets)
+Return JSON with the following fields:
+- location
+- overall_risk_level (Low/Medium/High)
+- key_risks: array of objects with {{category, level, rationale, practical_tips}}
+Categories must include:
+weather, political, military, public_security, health, transport, women_safety, discrimination
+
+Keep it concise but actionable.
 """
 
-    prompt_zh = f"""
-你是一名风险分析师。
-请对做结构化的全球风险分析。
+    prompt_cn = f"""
+请对 {request.location} 做一份结构化“全球风险”分析。
 
-输出格式：
-1）总体风险等级：低/中/高（单行）
-2）关键风险要点（6-10条要点）
-3）分类拆解（天气/政治/军事/治安/健康/交通）每类给简短要点
-4）实用安全建议（5-8条）
-5）置信度与数据局限（2-4条）
+请只输出 JSON，字段如下：
+- location
+- overall_risk_level（低/中/高）
+- key_risks：数组，每项包含 {{category, level, rationale, practical_tips}}
+category 必须包含：
+weather（天气）、political（政治）、military（军事/冲突）、public_security（治安）、health（健康/疫情）、transport（交通）、women_safety（女性安全）、discrimination（歧视/族群）
+
+要求：简洁但可执行。
 """
 
-    prompt = prompt_zh if request.language.lower().startswith("zh") else prompt_en
+    user_prompt = prompt_cn if request.language.lower().startswith("zh") else prompt_en
 
+    # 3) Call OpenAI (openai==0.28.1)
     try:
         resp = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
+            model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "You produce concise, structured risk reports."},
-                {"role": "user", "content": prompt},
+                {"role": "system", "content": "You are a risk analysis assistant. Output must be valid JSON only."},
+                {"role": "user", "content": user_prompt},
             ],
-            temperature=0.4,
-            max_tokens=700,
+            temperature=0.3,
+            max_tokens=800,
         )
         content = resp["choices"][0]["message"]["content"]
-        return {
-            "location": request.location,
-            "language": request.language,
-            "report": content,
-        }
-
+        return {"result": content}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"OpenAI request failed: {str(e)}")
+        # 把错误原因透出来，方便你在 Hoppscotch/Render logs 里直接定位
+        raise HTTPException(status_code=500, detail=f"OpenAI call failed: {repr(e)}")
