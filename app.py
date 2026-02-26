@@ -234,6 +234,24 @@ def engine_analyze(req: RiskRequest, request: Request):
     }
 
     return result
+
+    result["meta"] = {
+        "version": "gre-0.1",
+        "confidence": "Medium",
+        "disclaimer": "For informational and analytical purposes only.",
+        "non_reliance": "Users are solely responsible for decisions."
+    }
+
+    return result
+
+    result["meta"] = {
+        "version": "gre-0.1",
+        "confidence": "Medium",
+        "disclaimer": "For informational and analytical purposes only.",
+        "non_reliance": "Users are solely responsible for decisions."
+    }
+
+    return result
 def analyze_risk(req: RiskRequest, request: Request):
     _rate_limit(request)
     start = time.time()
