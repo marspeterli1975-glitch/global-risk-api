@@ -71,6 +71,18 @@ class RiskResponse(BaseModel):
 # Helpers
 # -----------------------------
 def _require_api_key():
+    def _require_app_key(request: Request):
+    """
+    Simple subscription gate.
+    Client must send header: X-API-Key: <APP_API_KEY>
+    """
+    server_key = os.getenv("APP_API_KEY", "")
+    if not server_key:
+        return
+
+    client_key = request.headers.get("x-api-key", "")
+    if client_key != server_key:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-API-Key")
     if not openai.api_key:
         raise HTTPException(
             status_code=500,
