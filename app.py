@@ -221,6 +221,20 @@ def health():
 
 
 @app.post("/analyze", response_model=RiskResponse)
+@app.post("/engine/analyze")
+def engine_analyze(req: RiskRequest, request: Request):
+    _require_app_key(request)
+
+    result = analyze_risk(req)
+
+    result["meta"] = {
+        "version": "gre-0.1",
+        "confidence": "Medium",
+        "disclaimer": "For informational and analytical purposes only.",
+        "non_reliance": "Users are solely responsible for decisions."
+    }
+
+    return result
 def analyze_risk(req: RiskRequest, request: Request):
     _rate_limit(request)
     start = time.time()
