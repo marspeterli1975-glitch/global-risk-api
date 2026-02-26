@@ -223,6 +223,25 @@ def health():
 @app.post("/engine/analyze")
 def engine_analyze(req: RiskRequest, request: Request):
     _require_app_key(request)
+    from fastapi import Request  # 放在文件顶部 imports 里也行（推荐放顶部）
+
+def _require_app_key(request: "Request"):
+    """
+    Simple subscription key gate.
+    Client must send header: X-API-Key: <key>
+    Server reads allowed keys from env: APP_API_KEYS
+    Example: APP_API_KEYS="k1,k2,k3"
+    """
+    allowed = os.getenv("APP_API_KEYS", "").strip()
+    if not allowed:
+        # 没配置就直接拒绝，避免“以为开了鉴权实际没开”的假安全
+        raise HTTPException(status_code=500, detail="APP_API_KEYS is not set on server.")
+
+    allowed_set = {k.strip() for k in allowed.split(",") if k.strip()}
+    supplied = (request.headers.get("X-API-Key") or "").strip()
+
+    if not supplied or supplied not in allowed_set:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-API-Key.")
 
     result = analyze_risk(req)
 
