@@ -1,358 +1,186 @@
-from fastapi import FastAPI, HTTPException, Request
+# app.py
+import os
+import time
+import traceback
+from typing import Optional, List, Literal
+
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import Literal, List, Dict, Any, Optional
-import os
-import openai
-import json
-import time
-import re
 
-app = FastAPI(title="Global Risk API", version="1.1.0")
 
-# -----------------------------
-# CORS (important for browsers / Coze / frontends)
-# -----------------------------
-# 生产环境建议把 "*" 换成你的前端域名白名单
+# ----------------------------
+# App init
+# ----------------------------
+app = FastAPI(title="Global Risk API", version="0.1.0")
+
+# CORS: 你用 Hoppscotch Browser 模式时会需要；Proxy/Agent/Extension 通常不需要
+# 为了省事，先放开 hoppscotch 域名。你后续上线再收紧 allow_origins。
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "https://hoppscotch.io",
+        "https://hoppscotch.com",
+        "http://localhost",
+        "http://localhost:3000",
+    ],
     allow_credentials=False,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*"],  # 关键：允许 X-API-Key / Authorization
 )
 
-# -----------------------------
-# OpenAI config
-# -----------------------------
-openai.api_key = os.getenv("OPENAI_API_KEY")
 
-DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-OPENAI_TIMEOUT_SEC = float(os.getenv("OPENAI_TIMEOUT_SEC", "30"))
-TEMPERATURE = float(os.getenv("OPENAI_TEMPERATURE", "0.2"))
-
-Language = Literal["en", "zh"]
-RiskLevel = Literal["Low", "Medium", "High"]
-
-CATEGORIES = [
-    "weather",
-    "political",
-    "military",
-    "public_security",
-    "health",
-    "transport",
-    "women_safety",
-    "discrimination",
-]
-
-
-# -----------------------------
+# ----------------------------
 # Models
-# -----------------------------
-class RiskRequest(BaseModel):
-    location: str = Field(..., min_length=1, max_length=80)
-    language: Language = "en"
+# ----------------------------
+class AnalyzeRequest(BaseModel):
+    location: str = Field(..., examples=["Tokyo"])
+    language: Literal["en", "zh"] = Field("en", examples=["en"])
 
 
-class RiskItem(BaseModel):
-    category: str
-    level: RiskLevel
-    rationale: str
-    practical_tips: str
-
-
-class RiskResponse(BaseModel):
+class AnalyzeResponse(BaseModel):
+    ok: bool
     location: str
-    overall_risk_level: RiskLevel
-    key_risks: List[RiskItem]
+    language: str
+    risk_score: int
+    summary: str
+    factors: List[dict]
+    meta: dict
 
 
-# -----------------------------
+# ----------------------------
 # Helpers
-# -----------------------------
-def _require_api_key():
-   def _require_app_key(request: Request):
+# ----------------------------
+def _extract_api_key(request: Request) -> Optional[str]:
     """
-    Simple subscription gate.
-    Client must send header: X-API-Key: <APP_API_KEY>
+    Support:
+      - X-API-Key: <key>
+      - Authorization: Bearer <key>
     """
-    server_key = os.getenv("APP_API_KEY", "")
-    if not server_key:
-        return
-
-    client_key = request.headers.get("x-api-key", "")
-    if client_key != server_key:
-        raise HTTPException(status_code=401, detail="Invalid or missing X-API-Key")
-        raise HTTPException(
-            status_code=500,
-            detail="OPENAI_API_KEY is missing on server. Set it in Render Environment variables."
-        )
-
-
-def _extract_json_object(text: str) -> Dict[str, Any]:
-    """
-    Robust JSON extraction:
-    - First try json.loads directly.
-    - If model adds extra text, try to extract the first {...} block and parse.
-    """
-    text = text.strip()
-
-    # 1) direct parse
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
-
-    # 2) extract first JSON object block
-    # This is a pragmatic approach to recover from minor prompt violations.
-    m = re.search(r"\{.*\}", text, flags=re.DOTALL)
-    if not m:
-        raise HTTPException(
-            status_code=502,
-            detail="Model returned non-JSON output (no JSON object found). Please retry."
-        )
-    candidate = m.group(0)
-    try:
-        return json.loads(candidate)
-    except Exception as e:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Model returned malformed JSON. Parse error: {e}"
-        )
-
-
-def _validate_schema(data: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Enforce required fields and 8 categories exactly once.
-    Also normalize category strings if needed.
-    """
-    for k in ("location", "overall_risk_level", "key_risks"):
-        if k not in data:
-            raise HTTPException(status_code=502, detail=f"Model JSON missing required field: {k}")
-
-    if not isinstance(data["key_risks"], list) or len(data["key_risks"]) != 8:
-        raise HTTPException(status_code=502, detail="key_risks must be a list of 8 items.")
-
-    seen = []
-    for item in data["key_risks"]:
-        if not isinstance(item, dict):
-            raise HTTPException(status_code=502, detail="Each key_risks item must be an object.")
-        if "category" not in item or "level" not in item or "rationale" not in item or "practical_tips" not in item:
-            raise HTTPException(status_code=502, detail="Each key_risks item must include category, level, rationale, practical_tips.")
-        cat = str(item["category"]).strip()
-        item["category"] = cat
-        seen.append(cat)
-
-    missing = [c for c in CATEGORIES if c not in seen]
-    extra = [c for c in seen if c not in CATEGORIES]
-    dup = [c for c in set(seen) if seen.count(c) > 1]
-
-    if missing or extra or dup:
-        raise HTTPException(
-            status_code=502,
-            detail={
-                "message": "key_risks categories must include all 8 categories exactly once.",
-                "missing": missing,
-                "extra": extra,
-                "duplicated": dup,
-                "expected": CATEGORIES,
-                "got": seen,
-            }
-        )
-
-    return data
-
-
-def _chat(messages: List[Dict[str, str]], temperature: float = TEMPERATURE) -> str:
-    _require_api_key()
-    try:
-        resp = openai.ChatCompletion.create(
-            model=DEFAULT_MODEL,
-            messages=messages,
-            temperature=temperature,
-            request_timeout=OPENAI_TIMEOUT_SEC,
-        )
-        return resp["choices"][0]["message"]["content"]
-    except openai.error.RateLimitError as e:
-        raise HTTPException(status_code=429, detail=f"OpenAI RateLimitError: {str(e)}")
-    except openai.error.AuthenticationError as e:
-        raise HTTPException(status_code=401, detail=f"OpenAI AuthenticationError: {str(e)}")
-    except openai.error.Timeout as e:
-        raise HTTPException(status_code=504, detail=f"OpenAI Timeout: {str(e)}")
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"OpenAI call failed: {str(e)}")
-
-
-# -----------------------------
-# Optional: lightweight in-memory rate limit (per IP)
-# -----------------------------
-# Default: 30 requests per 60 seconds per IP (can adjust by env)
-RATE_WINDOW_SEC = int(os.getenv("RATE_WINDOW_SEC", "60"))
-RATE_MAX_REQ = int(os.getenv("RATE_MAX_REQ", "30"))
-_ip_hits: Dict[str, List[float]] = {}
-
-
-def _rate_limit(request: Request):
-    ip = request.client.host if request.client else "unknown"
-    now = time.time()
-    hits = _ip_hits.get(ip, [])
-    hits = [t for t in hits if now - t <= RATE_WINDOW_SEC]
-    if len(hits) >= RATE_MAX_REQ:
-        raise HTTPException(
-            status_code=429,
-            detail=f"Rate limit exceeded: max {RATE_MAX_REQ} requests per {RATE_WINDOW_SEC}s"
-        )
-    hits.append(now)
-    _ip_hits[ip] = hits
-
-
-# -----------------------------
-# Routes
-# -----------------------------
-@app.get("/")
-def root():
-    return {"status": "ok", "service": "Global Risk API"}
-
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
-
-@app.post("/analyze", response_model=RiskResponse)
-@app.post("/engine/analyze")
-def engine_analyze(req: RiskRequest, request: Request):
-   import os
-from fastapi import Request, HTTPException
-
-def _require_app_key(request: Request) -> str:
-    """
-    API Key gate (MVP):
-    - read key from header: X-API-Key or Authorization: Bearer <key>
-    - compare against APP_API_KEYS (comma-separated)
-    - returns the key string if valid
-    """
-
-    # 1) extract key
     api_key = request.headers.get("X-API-Key")
-    if not api_key:
-        auth = request.headers.get("Authorization", "")
-        if auth.lower().startswith("bearer "):
-            api_key = auth.split(" ", 1)[1].strip()
+    if api_key and api_key.strip():
+        return api_key.strip()
 
+    auth = request.headers.get("Authorization", "")
+    if auth.lower().startswith("bearer "):
+        token = auth.split(" ", 1)[1].strip()
+        return token if token else None
+
+    return None
+
+
+def _load_allowed_keys() -> set[str]:
+    """
+    Read APP_API_KEYS (comma-separated).
+    Example:
+      APP_API_KEYS="key1,key2,key3"
+    """
+    raw = os.getenv("APP_API_KEYS", "").strip()
+    if not raw:
+        return set()
+    return {k.strip() for k in raw.split(",") if k.strip()}
+
+
+def require_api_key(request: Request) -> str:
+    """
+    API key gate for protected endpoints.
+    - Missing key -> 401
+    - Gate not configured -> 503
+    - Invalid key -> 403
+    """
+    api_key = _extract_api_key(request)
     if not api_key:
         raise HTTPException(status_code=401, detail="missing_api_key")
 
-    # 2) load allowed keys from env
-    raw = os.getenv("APP_API_KEYS", "")
-    if not raw.strip():
-        # 这里不要抛 500；用 503 表示服务尚未配置好
+    allowed = _load_allowed_keys()
+    if not allowed:
+        # 生产上这比 500 更合理：服务未配置好
         raise HTTPException(status_code=503, detail="api_key_gate_not_configured")
 
-    allowed = {k.strip() for k in raw.split(",") if k.strip()}
     if api_key not in allowed:
         raise HTTPException(status_code=403, detail="invalid_api_key")
 
     return api_key
 
-    result["meta"] = {
-        "version": "gre-0.1",
-        "confidence": "Medium",
-        "disclaimer": "For informational and analytical purposes only.",
-        "non_reliance": "Users are solely responsible for decisions."
-    }
 
+# ----------------------------
+# Error handling (JSON everywhere)
+# ----------------------------
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    debug = os.getenv("DEBUG", "0") == "1"
+    payload = {"detail": "internal_error", "error": str(exc)}
+    if debug:
+        payload["traceback_tail"] = traceback.format_exc().splitlines()[-30:]
+    return JSONResponse(status_code=500, content=payload)
+
+
+# ----------------------------
+# Routes
+# ----------------------------
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.post("/engine/analyze", response_model=AnalyzeResponse)
+def engine_analyze(req: AnalyzeRequest, request: Request):
+    # 1) API key gate
+    _ = require_api_key(request)
+
+    # 2) Business logic
+    #    这里我先给你一个稳定的“可返回结构”，避免你还没接上模型/数据就报错。
+    #    你后续把 analyze_risk(req) 的内部替换成真实逻辑（抓取、检索、归因、评分）。
+    t0 = time.time()
+    result = analyze_risk(req)
+    result["meta"]["latency_ms"] = int((time.time() - t0) * 1000)
     return result
 
-    result["meta"] = {
-        "version": "gre-0.1",
-        "confidence": "Medium",
-        "disclaimer": "For informational and analytical purposes only.",
-        "non_reliance": "Users are solely responsible for decisions."
+
+# ----------------------------
+# Core logic (replace with your engine later)
+# ----------------------------
+def analyze_risk(req: AnalyzeRequest) -> dict:
+    """
+    Placeholder risk engine.
+    Replace this with your real pipeline:
+      - fetch signals/news
+      - extract risk factors
+      - score/normalize
+      - generate summary
+    """
+    # 简单示例：用 location 做一个伪评分（保证永远不会崩）
+    base = 50
+    bump = 5 if req.location.lower() in {"tokyo", "japan"} else 0
+    score = max(0, min(100, base + bump))
+
+    factors = [
+        {"name": "macro", "score": 55, "evidence": ["placeholder"]},
+        {"name": "policy", "score": 45, "evidence": ["placeholder"]},
+        {"name": "security", "score": 50, "evidence": ["placeholder"]},
+    ]
+
+    summary_en = f"Risk assessment for {req.location}: overall score {score}/100."
+    summary_zh = f"{req.location} 风险评估：综合评分 {score}/100。"
+    summary = summary_en if req.language == "en" else summary_zh
+
+    return {
+        "ok": True,
+        "location": req.location,
+        "language": req.language,
+        "risk_score": score,
+        "summary": summary,
+        "factors": factors,
+        "meta": {
+            "engine_version": "0.1.0",
+            "data_mode": "placeholder",
+            "latency_ms": 0,
+        },
     }
-
-    return result
-
-    result["meta"] = {
-        "version": "gre-0.1",
-        "confidence": "Medium",
-        "disclaimer": "For informational and analytical purposes only.",
-        "non_reliance": "Users are solely responsible for decisions."
-    }
-
-    return result
-def analyze_risk(req: RiskRequest, request: Request):
-    _rate_limit(request)
-    start = time.time()
-
-    if req.language == "zh":
-        system = (
-            "你是一个严谨的风险分析助手。"
-            "你必须只输出严格 JSON（不要 Markdown、不要多余解释、不要代码块、不要前后缀文字）。"
-            "输出字段必须完全符合给定 schema。"
-        )
-        user = (
-            f"请对地点：{req.location} 做“旅行/差旅安全与公共风险”结构化评估。\n"
-            "你必须严格输出 JSON，schema 如下（字段名必须一致）：\n\n"
-            "{\n"
-            '  "location": "string",\n'
-            '  "overall_risk_level": "Low|Medium|High",\n'
-            '  "key_risks": [\n'
-            "    {\n"
-            '      "category": "weather|political|military|public_security|health|transport|women_safety|discrimination",\n'
-            '      "level": "Low|Medium|High",\n'
-            '      "rationale": "string",\n'
-            '      "practical_tips": "string"\n'
-            "    }\n"
-            "  ]\n"
-            "}\n\n"
-            "要求：\n"
-            "- key_risks 必须包含上述 8 类，每类 1 条\n"
-            "- rationale 要具体可解释，不要空话\n"
-            "- practical_tips 给出可执行建议\n"
-        )
-    else:
-        system = (
-            "You are a rigorous risk analyst. "
-            "You MUST output STRICT JSON only (no markdown, no extra text, no code fences). "
-            "The output must match the provided schema exactly."
-        )
-        user = (
-            f"Provide a structured travel/security risk assessment for: {req.location}.\n"
-            "You MUST output STRICT JSON only. Schema (field names must match):\n\n"
-            "{\n"
-            '  "location": "string",\n'
-            '  "overall_risk_level": "Low|Medium|High",\n'
-            '  "key_risks": [\n'
-            "    {\n"
-            '      "category": "weather|political|military|public_security|health|transport|women_safety|discrimination",\n'
-            '      "level": "Low|Medium|High",\n'
-            '      "rationale": "string",\n'
-            '      "practical_tips": "string"\n'
-            "    }\n"
-            "  ]\n"
-            "}\n\n"
-            "Requirements:\n"
-            "- key_risks must include ALL 8 categories exactly once\n"
-            "- rationale must be specific and explainable\n"
-            "- practical_tips must be actionable\n"
-        )
-
-    content = _chat(
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        temperature=TEMPERATURE,
-    )
-
-    data = _extract_json_object(content)
-    data = _validate_schema(data)
-
-    # Add meta for debugging (safe for downstream; remove if you don't want)
-    data["_meta"] = {
-        "model": DEFAULT_MODEL,
-        "latency_ms": int((time.time() - start) * 1000),
-    }
-
     return data
