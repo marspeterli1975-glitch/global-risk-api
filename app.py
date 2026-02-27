@@ -1,473 +1,357 @@
-# app.py
 import os
-import time
 import json
+import time
 import hashlib
-import traceback
-from typing import Optional, List, Literal, Dict, Any
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote
+from urllib.request import Request, urlopen
+from email.utils import parsedate_to_datetime
 
-import requests
-import xml.etree.ElementTree as ET
-
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, Request as FastAPIRequest, HTTPException
 from pydantic import BaseModel, Field
 
+# OpenAI Python SDK v1.x
 from openai import OpenAI
 
+APP_VERSION = "0.3.0-llm"
 
-# ----------------------------
-# App init
-# ----------------------------
-app = FastAPI(title="Global Risk API", version="0.3.0-llm")
+# -----------------------------
+# Config helpers
+# -----------------------------
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)).strip())
+    except Exception:
+        return default
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "https://hoppscotch.io",
-        "https://hoppscotch.com",
-        "http://localhost",
-        "http://localhost:3000",
-    ],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+def _env_bool(name: str, default: bool = False) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "y", "on")
 
-SESSION = requests.Session()
-SESSION.headers.update(
-    {
-        "User-Agent": "global-risk-api/0.3.0 (+https://global-risk-api.onrender.com)",
-        "Accept": "*/*",
-    }
-)
-
-_CACHE: Dict[str, Dict[str, Any]] = {}
-
-
-# ----------------------------
-# Models
-# ----------------------------
-class AnalyzeRequest(BaseModel):
-    location: str = Field(..., examples=["Tokyo"])
-    language: Literal["en", "zh"] = Field("en", examples=["en"])
-
-
-class AnalyzeResponse(BaseModel):
-    ok: bool
-    location: str
-    language: str
-    risk_score: int
-    summary: str
-    factors: List[Dict[str, Any]]
-    meta: dict
-
-
-# ----------------------------
-# API Key Gate
-# ----------------------------
-def _extract_api_key(request: Request) -> Optional[str]:
-    api_key = request.headers.get("X-API-Key")
-    if api_key and api_key.strip():
-        return api_key.strip()
-
-    auth = request.headers.get("Authorization", "")
-    if auth.lower().startswith("bearer "):
-        token = auth.split(" ", 1)[1].strip()
-        return token if token else None
-    return None
-
-
-def _load_allowed_keys() -> set[str]:
-    raw = os.getenv("APP_API_KEYS", "").strip()
+def _get_app_api_keys() -> List[str]:
+    """
+    APP_API_KEYS supports:
+      - single key: "abc"
+      - multiple keys: "abc,def,ghi"
+      - JSON array: ["abc","def"]
+    """
+    raw = (os.getenv("APP_API_KEYS") or "").strip()
     if not raw:
-        return set()
-    return {k.strip() for k in raw.split(",") if k.strip()}
+        return []
+    if raw.startswith("["):
+        try:
+            arr = json.loads(raw)
+            return [str(x).strip() for x in arr if str(x).strip()]
+        except Exception:
+            pass
+    # comma separated
+    return [x.strip() for x in raw.split(",") if x.strip()]
 
-
-def require_api_key(request: Request) -> str:
-    api_key = _extract_api_key(request)
-    if not api_key:
+def _require_app_key(req: FastAPIRequest) -> str:
+    auth = req.headers.get("Authorization", "")
+    if not auth.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="missing_api_key")
+    token = auth.split(" ", 1)[1].strip()
+    keys = _get_app_api_keys()
+    if not keys:
+        # server misconfig
+        raise HTTPException(status_code=500, detail="APP_API_KEYS is not set on server.")
+    if token not in keys:
+        raise HTTPException(status_code=401, detail="invalid_api_key")
+    return token
 
-    allowed = _load_allowed_keys()
-    if not allowed:
-        raise HTTPException(status_code=503, detail="api_key_gate_not_configured")
+# -----------------------------
+# RSS fetch + cache
+# -----------------------------
+_CACHE: Dict[str, Tuple[float, Any]] = {}  # key -> (expires_at, value)
 
-    if api_key not in allowed:
-        raise HTTPException(status_code=403, detail="invalid_api_key")
+def _cache_get(key: str) -> Optional[Any]:
+    now = time.time()
+    item = _CACHE.get(key)
+    if not item:
+        return None
+    exp, val = item
+    if now >= exp:
+        _CACHE.pop(key, None)
+        return None
+    return val
 
-    return api_key
+def _cache_set(key: str, val: Any, ttl: int) -> None:
+    _CACHE[key] = (time.time() + ttl, val)
 
+def _http_get(url: str, timeout: int = 15) -> bytes:
+    req = Request(url, headers={"User-Agent": "global-risk-api/0.3"})
+    with urlopen(req, timeout=timeout) as resp:
+        return resp.read()
 
-# ----------------------------
-# Error handling
-# ----------------------------
-@app.exception_handler(HTTPException)
-async def http_exception_handler(request: Request, exc: HTTPException):
-    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+def _google_news_rss_url(location: str, language: str) -> str:
+    # Google News RSS query
+    # We keep it simple: query by location keyword; you can extend later.
+    q = quote(location)
+    # language is kept as informational in this RSS; GN RSS doesn’t strictly honor it always.
+    return f"https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en"
 
+def _parse_rss_items(xml_bytes: bytes, max_items: int) -> List[Dict[str, Any]]:
+    import xml.etree.ElementTree as ET
 
-@app.exception_handler(Exception)
-async def unhandled_exception_handler(request: Request, exc: Exception):
-    debug = os.getenv("DEBUG", "0") == "1"
-    payload = {"detail": "internal_error", "error": str(exc)}
-    if debug:
-        payload["traceback_tail"] = traceback.format_exc().splitlines()[-40:]
-    return JSONResponse(status_code=500, content=payload)
-
-
-# ----------------------------
-# Routes
-# ----------------------------
-@app.get("/health")
-def health():
-    return {"status": "ok", "version": "0.3.0-llm"}
-
-
-@app.post("/engine/analyze", response_model=AnalyzeResponse)
-def engine_analyze(req: AnalyzeRequest, request: Request):
-    require_api_key(request)
-
-    t0 = time.time()
-    out = analyze_risk(req.location, req.language)
-    out["meta"]["latency_ms"] = int((time.time() - t0) * 1000)
-    return out
-
-
-# ----------------------------
-# Engine (RSS -> LLM -> Scores)
-# ----------------------------
-def analyze_risk(location: str, language: str) -> dict:
-    data_mode = os.getenv("DATA_MODE", "live_rss_llm")
-    ttl = int(os.getenv("CACHE_TTL_SECONDS", "900"))
-
-    cache_key = _cache_key(location=location, language=language, mode=data_mode)
-    cached = _cache_get(cache_key, ttl)
-    if cached:
-        return cached
-
-    max_signals = int(os.getenv("MAX_SIGNALS", "12"))
-
-    signals = collect_signals_rss(location, limit=max_signals)
-
-    # LLM structured extraction
-    events = llm_extract_events(location, language, signals)
-
-    # Score aggregation
-    factors = score_from_events(events, signals)
-
-    risk_score = int(round(sum(f["score"] for f in factors) / max(1, len(factors))))
-    risk_score = max(0, min(100, risk_score))
-
-    summary = generate_summary(location, language, risk_score, factors, events)
-
-    payload = {
-        "ok": True,
-        "location": location,
-        "language": language,
-        "risk_score": risk_score,
-        "summary": summary,
-        "factors": factors,
-        "meta": {
-            "engine_version": "0.3.0-llm",
-            "data_mode": data_mode,
-            "signals_count": len(signals),
-            "events_count": len(events),
-            "llm_model": os.getenv("LLM_MODEL", "gpt-4o-mini"),
-            "latency_ms": 0,
-        },
-    }
-
-    _cache_set(cache_key, payload)
-    return payload
-
-
-def collect_signals_rss(location: str, limit: int = 12) -> List[Dict[str, Any]]:
-    q = location.strip()
-    url = (
-        "https://news.google.com/rss/search?"
-        f"q={requests.utils.quote(q)}%20when%3A7d&hl=en-US&gl=US&ceid=US:en"
-    )
-    return fetch_rss(url, source="Google News RSS", limit=limit)
-
-
-def fetch_rss(url: str, source: str, limit: int = 10) -> List[Dict[str, Any]]:
-    resp = SESSION.get(url, timeout=25)
-    resp.raise_for_status()
-
-    root = ET.fromstring(resp.text)
+    root = ET.fromstring(xml_bytes)
     channel = root.find("channel")
     if channel is None:
         return []
 
     out: List[Dict[str, Any]] = []
-    for item in channel.findall("item")[:limit]:
+    for item in channel.findall("item")[:max_items]:
         title = (item.findtext("title") or "").strip()
         link = (item.findtext("link") or "").strip()
-        pub_date = (item.findtext("pubDate") or "").strip()
+        pub = (item.findtext("pubDate") or "").strip()
+        source = "Google News RSS"
+
+        published_at = None
+        if pub:
+            try:
+                dt = parsedate_to_datetime(pub)
+                published_at = dt.isoformat()
+            except Exception:
+                published_at = pub
+
         out.append(
             {
                 "title": title,
-                "url": link,
-                "published_at": pub_date,
                 "source": source,
+                "url": link,
+                "published_at": published_at,
             }
         )
     return out
 
+def fetch_signals_live_rss(location: str, language: str, cache_ttl: int, max_signals: int) -> List[Dict[str, Any]]:
+    ck = "rss:" + hashlib.sha1(f"{location}|{language}|{max_signals}".encode("utf-8")).hexdigest()
+    cached = _cache_get(ck)
+    if cached is not None:
+        return cached
 
-# ----------------------------
-# LLM extraction
-# ----------------------------
-def llm_extract_events(location: str, language: str, signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    url = _google_news_rss_url(location, language)
+    xml_bytes = _http_get(url)
+    items = _parse_rss_items(xml_bytes, max_items=max_signals)
+
+    _cache_set(ck, items, ttl=cache_ttl)
+    return items
+
+# -----------------------------
+# Fallback keyword scoring
+# -----------------------------
+def _count_hits(texts: List[str], keywords: List[str]) -> int:
+    count = 0
+    for t in texts:
+        for k in keywords:
+            if k in t:
+                count += 1
+    return count
+
+def build_evidence(signals: List[Dict[str, Any]], keywords: List[str], max_items: int = 3) -> List[Dict[str, Any]]:
+    kws = [k.lower() for k in keywords]
+    out: List[Dict[str, Any]] = []
+    for s in signals:
+        t = (s.get("title") or "").lower()
+        if any(k in t for k in kws):
+            out.append(s)
+        if len(out) >= max_items:
+            break
+    # If not enough, just return top items as placeholder evidence
+    if not out:
+        out = signals[:max_items]
+    return out
+
+def score_factors_keyword(location: str, signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    texts = [(s.get("title") or "").lower() for s in signals]
+
+    macro_kw = ["inflation", "recession", "gdp", "fx", "currency", "interest rate", "oil", "energy"]
+    policy_kw = ["sanction", "regulation", "law", "ban", "visa", "tariff", "restriction"]
+    security_kw = ["attack", "crime", "protest", "earthquake", "typhoon", "flood", "explosion"]
+
+    macro_hits = _count_hits(texts, macro_kw)
+    policy_hits = _count_hits(texts, policy_kw)
+    security_hits = _count_hits(texts, security_kw)
+
+    macro_score = min(100, 45 + macro_hits * 8)
+    policy_score = min(100, 40 + policy_hits * 10)
+    security_score = min(100, 45 + security_hits * 10)
+
+    return [
+        {"name": "macro", "score": macro_score, "evidence": build_evidence(signals, macro_kw, max_items=3)},
+        {"name": "policy", "score": policy_score, "evidence": build_evidence(signals, policy_kw, max_items=3)},
+        {"name": "security", "score": security_score, "evidence": build_evidence(signals, security_kw, max_items=3)},
+    ]
+
+# -----------------------------
+# LLM scoring (Route A: RSS -> LLM)
+# -----------------------------
+def score_with_llm(location: str, language: str, signals: List[Dict[str, Any]]) -> Dict[str, Any]:
+    api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
     if not api_key:
-        # No key: fallback to empty events (still works but less useful)
-        return []
+        raise RuntimeError("OPENAI_API_KEY not set")
 
-    model = os.getenv("LLM_MODEL", "gpt-4o-mini")
+    model = (os.getenv("LLM_MODEL") or "gpt-4o-mini").strip()
     client = OpenAI(api_key=api_key)
 
-    # Compact input to control cost
-    items = []
-    for i, s in enumerate(signals):
-        items.append(
-            {
-                "id": i,
-                "title": s.get("title", ""),
-                "source": s.get("source", ""),
-                "published_at": s.get("published_at", ""),
-                "url": s.get("url", ""),
-            }
-        )
-
-    sys = (
-        "You are a risk analyst. Extract structured risk events from news headlines. "
-        "Return ONLY valid JSON. No markdown."
-    )
-
-    # We ask for structured output with simple schema.
-    # category must be one of: macro, policy, security, logistics, finance
-    # impact: -1..1 (negative is worse), probability: 0..1, severity: 0..100
-    user = {
-        "task": "extract_risk_events",
+    # Keep payload small & deterministic
+    compact_signals = signals[: _env_int("MAX_SIGNALS", 12)]
+    prompt = {
+        "task": "You are a geopolitical & supply-chain risk analyst. Use the provided news signals to score risk for the location.",
         "location": location,
         "language": language,
-        "categories": ["macro", "policy", "security", "logistics", "finance"],
-        "input_items": items,
+        "signals": compact_signals,
         "output_schema": {
-            "events": [
+            "risk_score": "int 0-100",
+            "summary": "short string",
+            "factors": [
                 {
-                    "item_id": "int",
-                    "category": "macro|policy|security|logistics|finance",
-                    "event": "short string",
-                    "impact": "number -1..1",
-                    "probability": "number 0..1",
-                    "severity": "int 0..100",
-                    "rationale": "short string"
+                    "name": "macro|policy|security",
+                    "score": "int 0-100",
+                    "event": "string",
+                    "severity": "low|medium|high",
+                    "probability": "low|medium|high",
+                    "impact": "low|medium|high",
+                    "rationale": "1-2 sentences",
+                    "evidence": [
+                        {
+                            "title": "string",
+                            "source": "string",
+                            "url": "string",
+                            "published_at": "string|null"
+                        }
+                    ]
                 }
             ]
         },
         "rules": [
-            "Use title only; do not browse the URL.",
-            "If headline is not about risk, either omit it or set severity low.",
-            "Keep rationale under 25 words.",
+            "Return STRICT JSON only, no markdown.",
+            "Use only the provided signals; do not invent sources.",
+            "If evidence is weak, keep scores closer to 40-60 and say uncertainty in rationale."
         ],
     }
 
     resp = client.chat.completions.create(
         model=model,
         messages=[
-            {"role": "system", "content": sys},
-            {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
+            {"role": "system", "content": "Return STRICT JSON only."},
+            {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
         ],
         temperature=0.2,
     )
 
     content = resp.choices[0].message.content or ""
-    data = _safe_json_loads(content)
-    if not data or "events" not in data or not isinstance(data["events"], list):
-        return []
+    data = json.loads(content)
 
-    # sanitize events
-    clean: List[Dict[str, Any]] = []
-    for e in data["events"]:
-        try:
-            item_id = int(e.get("item_id"))
-            category = str(e.get("category", "")).strip()
-            if category not in {"macro", "policy", "security", "logistics", "finance"}:
-                continue
-            event = str(e.get("event", "")).strip()[:200]
-            impact = float(e.get("impact", 0.0))
-            prob = float(e.get("probability", 0.5))
-            sev = int(e.get("severity", 0))
-            rationale = str(e.get("rationale", "")).strip()[:220]
+    # Minimal validation / normalization
+    if "risk_score" not in data or "factors" not in data:
+        raise RuntimeError("LLM response missing fields")
+    return data
 
-            impact = max(-1.0, min(1.0, impact))
-            prob = max(0.0, min(1.0, prob))
-            sev = max(0, min(100, sev))
+# -----------------------------
+# FastAPI models
+# -----------------------------
+class AnalyzeRequest(BaseModel):
+    location: str = Field(..., min_length=1)
+    language: str = Field("en")
 
-            clean.append(
-                {
-                    "item_id": item_id,
-                    "category": category,
-                    "event": event,
-                    "impact": impact,
-                    "probability": prob,
-                    "severity": sev,
-                    "rationale": rationale,
-                }
-            )
-        except Exception:
-            continue
+app = FastAPI(title="Global Risk API", version=APP_VERSION)
 
-    return clean
+@app.get("/health")
+def health() -> Dict[str, Any]:
+    return {
+        "status": "ok",
+        "version": APP_VERSION,
+        "openai_configured": bool((os.getenv("OPENAI_API_KEY") or "").strip()),
+    }
 
+@app.post("/engine/analyze")
+async def engine_analyze(req: FastAPIRequest, body: AnalyzeRequest) -> Dict[str, Any]:
+    _require_app_key(req)
 
-def _safe_json_loads(s: str) -> Optional[dict]:
-    s = s.strip()
-    if not s:
-        return None
-    # Try direct parse
+    location = body.location.strip()
+    language = (body.language or "en").strip()
+
+    data_mode = (os.getenv("DATA_MODE") or "live_rss").strip()
+    cache_ttl = _env_int("CACHE_TTL_SECONDS", 900)
+    max_signals = _env_int("MAX_SIGNALS", 12)
+    debug = _env_bool("DEBUG", False)
+
+    t0 = time.time()
+
     try:
-        return json.loads(s)
-    except Exception:
-        pass
-    # Try to salvage JSON substring
-    lb = s.find("{")
-    rb = s.rfind("}")
-    if lb != -1 and rb != -1 and rb > lb:
-        try:
-            return json.loads(s[lb : rb + 1])
-        except Exception:
-            return None
-    return None
+        if data_mode != "live_rss":
+            # In this project, Route A = RSS. Keep strict.
+            data_mode = "live_rss"
 
+        signals = fetch_signals_live_rss(location, language, cache_ttl=cache_ttl, max_signals=max_signals)
 
-# ----------------------------
-# Scoring from events
-# ----------------------------
-def score_from_events(events: List[Dict[str, Any]], signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Convert extracted events into factor scores (0..100) with explainable evidence.
-    Score formula (simple & explainable):
-      category_score = clamp( baseline + sum( severity * probability * max(0, -impact) / 10 ), 0..100 )
-    impact negative => risk; positive => reduce risk
-    """
-    by_cat: Dict[str, List[Dict[str, Any]]] = {"macro": [], "policy": [], "security": [], "logistics": [], "finance": []}
-    for e in events:
-        by_cat[e["category"]].append(e)
-
-    # Baselines: conservative
-    baseline = {"macro": 45, "policy": 40, "security": 45, "logistics": 40, "finance": 42}
-
-    factors: List[Dict[str, Any]] = []
-    for cat, es in by_cat.items():
-        score = baseline.get(cat, 40)
-
-        # accumulate risk contributions
-        contrib = 0.0
-        for e in es:
-            sev = float(e.get("severity", 0))
-            prob = float(e.get("probability", 0.5))
-            impact = float(e.get("impact", 0.0))
-            risk_dir = max(0.0, -impact)  # only negative impact adds risk
-            contrib += (sev * prob * risk_dir) / 10.0
-
-        score = int(round(max(0.0, min(100.0, score + contrib))))
-
-        evidence = build_evidence_from_events(cat, es, signals, max_items=3)
-
-        # Only output the 3 core factors to keep response stable with your current UI
-        # If you want all 5 categories, tell me and I'll expose all.
-        if cat in {"macro", "policy", "security"}:
-            factors.append({"name": cat, "score": score, "evidence": evidence})
-
-    # Ensure order
-    order = {"macro": 0, "policy": 1, "security": 2}
-    factors.sort(key=lambda x: order.get(x["name"], 9))
-    return factors
-
-
-def build_evidence_from_events(category: str, events: List[Dict[str, Any]], signals: List[Dict[str, Any]], max_items: int = 3) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    # rank events by severity*probability
-    ranked = sorted(events, key=lambda e: float(e.get("severity", 0)) * float(e.get("probability", 0.5)), reverse=True)
-
-    for e in ranked[:max_items]:
-        item_id = e.get("item_id")
-        s = signals[item_id] if isinstance(item_id, int) and 0 <= item_id < len(signals) else None
-        if not s:
-            continue
-        title = s.get("title", "")
-        url = s.get("url", "")
-        src = s.get("source", "")
-        pub = s.get("published_at", None)
-
-        out.append(
-            {
-                "title": title,
-                "source": src,
-                "url": url,
-                "published_at": pub,
-                "event": e.get("event"),
-                "severity": e.get("severity"),
-                "probability": e.get("probability"),
-                "impact": e.get("impact"),
-                "rationale": e.get("rationale"),
+        # If no signals, fallback to empty keyword scoring
+        if not signals:
+            factors = score_factors_keyword(location, [])
+            return {
+                "ok": True,
+                "location": location,
+                "language": language,
+                "risk_score": 50,
+                "summary": f"No fresh signals found for {location}. Returning neutral score.",
+                "factors": factors,
+                "meta": {
+                    "engine_version": APP_VERSION,
+                    "data_mode": data_mode,
+                    "latency_ms": int((time.time() - t0) * 1000),
+                },
             }
-        )
 
-    # fallback: if LLM produced nothing for this category, show top headlines
-    if not out:
-        for s in signals[:max_items]:
-            out.append(
-                {
-                    "title": s.get("title", ""),
-                    "source": s.get("source", ""),
-                    "url": s.get("url", ""),
-                    "published_at": s.get("published_at"),
-                    "event": None,
-                    "severity": 0,
-                    "probability": 0,
-                    "impact": 0,
-                    "rationale": "No structured events extracted; showing context headlines.",
-                }
-            )
-    return out
+        # LLM first
+        llm_data = score_with_llm(location, language, signals)
 
+        out = {
+            "ok": True,
+            "location": location,
+            "language": language,
+            "risk_score": int(llm_data.get("risk_score", 50)),
+            "summary": llm_data.get("summary", ""),
+            "factors": llm_data.get("factors", []),
+            "meta": {
+                "engine_version": APP_VERSION,
+                "data_mode": data_mode,
+                "model": (os.getenv("LLM_MODEL") or "gpt-4o-mini").strip(),
+                "signals": len(signals),
+                "latency_ms": int((time.time() - t0) * 1000),
+            },
+        }
+        return out
 
-def generate_summary(location: str, language: str, risk_score: int, factors: List[Dict[str, Any]], events: List[Dict[str, Any]]) -> str:
-    top = sorted(events, key=lambda e: float(e.get("severity", 0)) * float(e.get("probability", 0.5)), reverse=True)[:3]
-    if language == "zh":
-        brief = "；".join([f"{t['category']}：{t['event']}" for t in top]) if top else "暂无高置信度事件。"
-        bullets = "；".join([f"{f['name']}={f['score']}" for f in factors])
-        return f"{location} 风险概览：综合评分 {risk_score}/100。分项（越高风险越高）：{bullets}。主要风险事件：{brief}。"
-    else:
-        brief = "; ".join([f"{t['category']}: {t['event']}" for t in top]) if top else "No high-confidence events extracted."
-        bullets = ", ".join([f"{f['name']}={f['score']}" for f in factors])
-        return f"Risk overview for {location}: overall score {risk_score}/100. Factor scores: {bullets}. Key events: {brief}."
+    except Exception as e:
+        # Hard fallback: keyword scoring so API stays up
+        try:
+            signals = fetch_signals_live_rss(location, language, cache_ttl=cache_ttl, max_signals=max_signals)
+        except Exception:
+            signals = []
 
+        factors = score_factors_keyword(location, signals)
 
-# ----------------------------
-# Cache utils
-# ----------------------------
-def _cache_key(**kwargs) -> str:
-    raw = json.dumps(kwargs, sort_keys=True, ensure_ascii=False)
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        # overall risk: avg factors
+        scores = [f.get("score", 50) for f in factors] or [50]
+        risk_score = int(sum(scores) / len(scores))
 
+        if debug:
+            raise HTTPException(status_code=500, detail={"detail": "internal_error", "error": str(e)})
 
-def _cache_get(key: str, ttl_seconds: int) -> Optional[dict]:
-    rec = _CACHE.get(key)
-    if not rec:
-        return None
-    if time.time() - rec["ts"] > ttl_seconds:
-        _CACHE.pop(key, None)
-        return None
-    return rec["val"]
-
-
-def _cache_set(key: str, val: dict):
-    _CACHE[key] = {"ts": time.time(), "val": val}
+        return {
+            "ok": True,
+            "location": location,
+            "language": language,
+            "risk_score": risk_score,
+            "summary": f"Fallback scoring for {location}. (LLM unavailable or failed.)",
+            "factors": factors,
+            "meta": {
+                "engine_version": APP_VERSION,
+                "data_mode": data_mode,
+                "fallback": "keyword",
+                "latency_ms": int((time.time() - t0) * 1000),
+            },
+        }
