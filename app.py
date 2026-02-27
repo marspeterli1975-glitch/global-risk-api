@@ -5,7 +5,6 @@ import json
 import hashlib
 import traceback
 from typing import Optional, List, Literal, Dict, Any
-from datetime import datetime, timezone
 
 import requests
 import xml.etree.ElementTree as ET
@@ -19,7 +18,7 @@ from pydantic import BaseModel, Field
 # ----------------------------
 # App init
 # ----------------------------
-app = FastAPI(title="Global Risk API", version="0.2.0")
+app = FastAPI(title="Global Risk API", version="0.2.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -31,18 +30,18 @@ app.add_middleware(
     ],
     allow_credentials=False,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*"],  # allow X-API-Key / Authorization
 )
 
 SESSION = requests.Session()
 SESSION.headers.update(
     {
-        "User-Agent": "global-risk-api/0.2.0 (+https://global-risk-api.onrender.com)",
+        "User-Agent": "global-risk-api/0.2.1 (+https://global-risk-api.onrender.com)",
         "Accept": "*/*",
     }
 )
 
-# Simple in-memory cache (good enough for Render single instance; resets on redeploy/sleep)
+# In-memory cache (OK for Render single instance; resets on restart/sleep)
 _CACHE: Dict[str, Dict[str, Any]] = {}
 
 
@@ -81,17 +80,21 @@ class AnalyzeResponse(BaseModel):
 # API Key Gate
 # ----------------------------
 def _extract_api_key(request: Request) -> Optional[str]:
+    # Support: X-API-Key or Authorization: Bearer <key>
     api_key = request.headers.get("X-API-Key")
     if api_key and api_key.strip():
         return api_key.strip()
+
     auth = request.headers.get("Authorization", "")
     if auth.lower().startswith("bearer "):
         token = auth.split(" ", 1)[1].strip()
         return token if token else None
+
     return None
 
 
 def _load_allowed_keys() -> set[str]:
+    # Comma-separated keys
     raw = os.getenv("APP_API_KEYS", "").strip()
     if not raw:
         return set()
@@ -102,16 +105,19 @@ def require_api_key(request: Request) -> str:
     api_key = _extract_api_key(request)
     if not api_key:
         raise HTTPException(status_code=401, detail="missing_api_key")
+
     allowed = _load_allowed_keys()
     if not allowed:
         raise HTTPException(status_code=503, detail="api_key_gate_not_configured")
+
     if api_key not in allowed:
         raise HTTPException(status_code=403, detail="invalid_api_key")
+
     return api_key
 
 
 # ----------------------------
-# Error handling
+# Error handling (JSON everywhere)
 # ----------------------------
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
@@ -157,27 +163,28 @@ def analyze_risk(location: str, language: str) -> dict:
     if cached:
         return cached
 
-    # 1) collect signals
+    # 1) collect signals (RSS)
     signals = collect_signals_rss(location)
 
-    # 2) extract & score factors (simple heuristic for now)
+    # 2) score factors (MVP heuristic)
     factors = score_factors(location, signals)
 
     # 3) aggregate risk score
     risk_score = int(round(sum(f["score"] for f in factors) / max(1, len(factors))))
+    risk_score = max(0, min(100, risk_score))
 
-    # 4) generate summary (optionally with OpenAI)
+    # 4) summary (deterministic for now)
     summary = generate_summary(location, language, risk_score, factors)
 
     payload = {
         "ok": True,
         "location": location,
         "language": language,
-        "risk_score": max(0, min(100, risk_score)),
+        "risk_score": risk_score,
         "summary": summary,
         "factors": factors,
         "meta": {
-            "engine_version": "0.2.0",
+            "engine_version": "0.2.1",
             "data_mode": data_mode,
             "signals_count": len(signals),
             "latency_ms": 0,
@@ -191,18 +198,14 @@ def analyze_risk(location: str, language: str) -> dict:
 def collect_signals_rss(location: str) -> List[Dict[str, Any]]:
     """
     RSS sources:
-      - Google News RSS for broad coverage (location-based query)
-      - You can add more official/vertical sources later
+      - Google News RSS for broad coverage (location query, last 7 days)
     """
     q = location.strip()
-    # Google News RSS (query)
     url = (
         "https://news.google.com/rss/search?"
         f"q={requests.utils.quote(q)}%20when%3A7d&hl=en-US&gl=US&ceid=US:en"
     )
-
-    items = fetch_rss(url, source="Google News RSS", limit=12)
-    return items
+    return fetch_rss(url, source="Google News RSS", limit=12)
 
 
 def fetch_rss(url: str, source: str, limit: int = 10) -> List[Dict[str, Any]]:
@@ -233,12 +236,11 @@ def fetch_rss(url: str, source: str, limit: int = 10) -> List[Dict[str, Any]]:
 def score_factors(location: str, signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Simple scoring (MVP):
-      - macro: baseline + "inflation / recession / GDP / FX" keywords
-      - policy: "sanction / regulation / law / ban / visa" keywords
-      - security: "attack / crime / protest / earthquake / typhoon" keywords
-    Each factor returns evidence items with URLs.
+      - macro: baseline + macro keywords
+      - policy: baseline + policy keywords
+      - security: baseline + security keywords
     """
-    texts = [s.get("title", "").lower() for s in signals]
+    texts = [(s.get("title") or "").lower() for s in signals]
 
     macro_kw = ["inflation", "recession", "gdp", "fx", "currency", "interest rate", "oil", "energy"]
     policy_kw = ["sanction", "regulation", "law", "ban", "visa", "tariff", "restriction"]
@@ -248,7 +250,6 @@ def score_factors(location: str, signals: List[Dict[str, Any]]) -> List[Dict[str
     policy_hits = _count_hits(texts, policy_kw)
     security_hits = _count_hits(texts, security_kw)
 
-    # baseline scores
     macro_score = min(100, 45 + macro_hits * 8)
     policy_score = min(100, 40 + policy_hits * 10)
     security_score = min(100, 45 + security_hits * 10)
@@ -264,8 +265,18 @@ def score_factors(location: str, signals: List[Dict[str, Any]]) -> List[Dict[str
     ]
 
 
+def _count_hits(texts: List[str], keywords: List[str]) -> int:
+    count = 0
+    for t in texts:
+        for k in keywords:
+            if k in t:
+                count += 1
+    return count
+
+
 def build_evidence(signals: List[Dict[str, Any]], keywords: List[str], max_items: int = 3) -> List[Dict[str, Any]]:
-    out = []
+    out: List[Dict[str, Any]] = []
+
     for s in signals:
         t = (s.get("title") or "").lower()
         if any(k in t for k in keywords):
@@ -279,7 +290,8 @@ def build_evidence(signals: List[Dict[str, Any]], keywords: List[str], max_items
             )
         if len(out) >= max_items:
             break
-    # If no matches, still provide top headlines as “context”
+
+    # If no matches, still provide top headlines as context evidence
     if not out:
         for s in signals[:max_items]:
             out.append(
@@ -290,14 +302,11 @@ def build_evidence(signals: List[Dict[str, Any]], keywords: List[str], max_items
                     "published_at": s.get("published_at"),
                 }
             )
+
     return out
 
 
 def generate_summary(location: str, language: str, risk_score: int, factors: List[Dict[str, Any]]) -> str:
-    """
-    If OPENAI_API_KEY exists, we can produce a cleaner summary.
-    Otherwise return a deterministic summary.
-    """
     if language == "zh":
         base = f"{location} 风险概览：综合评分 {risk_score}/100。"
         bullets = "；".join([f"{f['name']}={f['score']}" for f in factors])
@@ -306,6 +315,7 @@ def generate_summary(location: str, language: str, risk_score: int, factors: Lis
         base = f"Risk overview for {location}: overall score {risk_score}/100."
         bullets = ", ".join([f"{f['name']}={f['score']}" for f in factors])
         return base + f" Factor scores (higher = riskier): {bullets}. Evidence sourced from public RSS/news."
+
 
 # ----------------------------
 # Cache utils
