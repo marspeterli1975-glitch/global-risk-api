@@ -222,28 +222,38 @@ def health():
 @app.post("/analyze", response_model=RiskResponse)
 @app.post("/engine/analyze")
 def engine_analyze(req: RiskRequest, request: Request):
-    _require_app_key(request)
-    from fastapi import Request  # 放在文件顶部 imports 里也行（推荐放顶部）
+   import os
+from fastapi import Request, HTTPException
 
-def _require_app_key(request: "Request"):
+def _require_app_key(request: Request) -> str:
     """
-    Simple subscription key gate.
-    Client must send header: X-API-Key: <key>
-    Server reads allowed keys from env: APP_API_KEYS
-    Example: APP_API_KEYS="k1,k2,k3"
+    API Key gate (MVP):
+    - read key from header: X-API-Key or Authorization: Bearer <key>
+    - compare against APP_API_KEYS (comma-separated)
+    - returns the key string if valid
     """
-    allowed = os.getenv("APP_API_KEYS", "").strip()
-    if not allowed:
-        # 没配置就直接拒绝，避免“以为开了鉴权实际没开”的假安全
-        raise HTTPException(status_code=500, detail="APP_API_KEYS is not set on server.")
 
-    allowed_set = {k.strip() for k in allowed.split(",") if k.strip()}
-    supplied = (request.headers.get("X-API-Key") or "").strip()
+    # 1) extract key
+    api_key = request.headers.get("X-API-Key")
+    if not api_key:
+        auth = request.headers.get("Authorization", "")
+        if auth.lower().startswith("bearer "):
+            api_key = auth.split(" ", 1)[1].strip()
 
-    if not supplied or supplied not in allowed_set:
-        raise HTTPException(status_code=401, detail="Invalid or missing X-API-Key.")
+    if not api_key:
+        raise HTTPException(status_code=401, detail="missing_api_key")
 
-    result = analyze_risk(req)
+    # 2) load allowed keys from env
+    raw = os.getenv("APP_API_KEYS", "")
+    if not raw.strip():
+        # 这里不要抛 500；用 503 表示服务尚未配置好
+        raise HTTPException(status_code=503, detail="api_key_gate_not_configured")
+
+    allowed = {k.strip() for k in raw.split(",") if k.strip()}
+    if api_key not in allowed:
+        raise HTTPException(status_code=403, detail="invalid_api_key")
+
+    return api_key
 
     result["meta"] = {
         "version": "gre-0.1",
