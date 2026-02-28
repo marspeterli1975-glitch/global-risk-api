@@ -2,3 +2,4 @@ fastapi==0.95.2
 uvicorn==0.22.0
 pydantic==1.10.13
 openai>=1.40.0
+stripe==10.12.0
