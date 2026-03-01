@@ -3,366 +3,310 @@ import json
 import time
 import hashlib
 from typing import Any, Dict, List, Optional
-from urllib.parse import quote
 
-from fastapi import FastAPI, Request as FastAPIRequest, HTTPException
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
-# third-party
-from openai import OpenAI  # openai>=1.40.0
-import stripe  # stripe>=10.x
+import stripe
+from openai import OpenAI
 
-APP_VERSION = "0.4.0-scrs-freemium"
 
-# ---------------------------
-# Env helpers
-# ---------------------------
-def _env_str(name: str, default: str = "") -> str:
-    v = os.getenv(name)
-    return default if v is None else str(v).strip()
-
-def _env_int(name: str, default: int) -> int:
-    v = _env_str(name, "")
-    if not v:
-        return default
-    try:
-        return int(v)
-    except Exception:
-        return default
-
-def _env_bool(name: str, default: bool = False) -> bool:
-    v = _env_str(name, "")
-    if not v:
-        return default
-    return v.lower() in ("1", "true", "yes", "y", "on")
-
-def _split_keys(raw: str) -> List[str]:
-    # supports: "k1,k2,k3" or "k1; k2" or newline
-    if not raw:
-        return []
-    parts = []
-    for sep in [",", ";", "\n", "\r\n"]:
-        if sep in raw:
-            raw = raw.replace(sep, ",")
-    for p in raw.split(","):
-        p = p.strip()
-        if p:
-            parts.append(p)
-    return parts
-
-# ---------------------------
+# =========================
 # Config
-# ---------------------------
-DEBUG = _env_bool("DEBUG", False)
+# =========================
+APP_VERSION = os.getenv("APP_VERSION", "0.4.0-scrs-freemium")
+DEBUG = os.getenv("DEBUG", "false").lower() in ("1", "true", "yes", "y")
 
-PAYMENT_MODE = _env_str("PAYMENT_MODE", "stripe").lower()  # stripe | off
-STRIPE_SECRET_KEY = _env_str("STRIPE_SECRET_KEY", "")
-OPENAI_API_KEY = _env_str("OPENAI_API_KEY", "")
-LLM_MODEL = _env_str("LLM_MODEL", "gpt-4o-mini")
-CACHE_TTL_SECONDS = _env_int("CACHE_TTL_SECONDS", 3600)
-MAX_SIGNALS = _env_int("MAX_SIGNALS", 12)
+LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
-APP_API_KEYS = _split_keys(_env_str("APP_API_KEYS", ""))  # optional: protect API
+PAYMENT_MODE = os.getenv("PAYMENT_MODE", "stripe").strip().lower()  # stripe / off / free
+STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "").strip()
+# STRIPE_WEBHOOK_SECRET 可选，如果你未来要用 webhook 来可靠发放权限
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "").strip()
 
-# token salt for redeeming a paid session into an API token
-TOKEN_SALT = _env_str("TOKEN_SALT", "change-me-please")
+CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "86400"))  # 默认 1 天
+MAX_SIGNALS = int(os.getenv("MAX_SIGNALS", "8"))
 
-# init stripe if configured
-if STRIPE_SECRET_KEY:
+# 你自己的 API Key 白名单（逗号分隔）
+APP_API_KEYS_RAW = os.getenv("APP_API_KEYS", "").strip()
+APP_API_KEYS = [x.strip() for x in APP_API_KEYS_RAW.split(",") if x.strip()]
+
+# 用于生成 token 的服务端盐（不设置就用 STRIPE_SECRET_KEY 的 hash 兜底）
+TOKEN_SALT = os.getenv("TOKEN_SALT", "").strip()
+if not TOKEN_SALT:
+    TOKEN_SALT = hashlib.sha256((STRIPE_SECRET_KEY or "fallback").encode("utf-8")).hexdigest()
+
+# Stripe 初始化
+stripe_configured = False
+if PAYMENT_MODE == "stripe" and STRIPE_SECRET_KEY:
     stripe.api_key = STRIPE_SECRET_KEY
+    stripe_configured = True
 
-# init openai if configured
-_openai_client: Optional[OpenAI] = None
+
+# OpenAI 初始化
+openai_configured = False
+client: Optional[OpenAI] = None
 if OPENAI_API_KEY:
-    _openai_client = OpenAI(api_key=OPENAI_API_KEY)
+    client = OpenAI(api_key=OPENAI_API_KEY)
+    openai_configured = True
 
-app = FastAPI(title="Global Risk API", version=APP_VERSION)
 
-# in-memory cache (simple)
-_cache: Dict[str, Dict[str, Any]] = {}
+# =========================
+# In-memory cache (Render 重启会丢；后续可升级到 DB/Redis)
+# =========================
+# paid_sessions[session_id] = {"paid": True, "created": ts, "email": "...", "amount_total": 2900, "currency": "usd"}
+paid_sessions: Dict[str, Dict[str, Any]] = {}
 
-# ---------------------------
-# Models
-# ---------------------------
+# issued_tokens[token] = {"session_id": "...", "created": ts}
+issued_tokens: Dict[str, Dict[str, Any]] = {}
+
+
+def _now() -> int:
+    return int(time.time())
+
+
+def _cleanup_cache() -> None:
+    """简单 TTL 清理"""
+    cutoff = _now() - CACHE_TTL_SECONDS
+    for sid in list(paid_sessions.keys()):
+        if int(paid_sessions[sid].get("created", 0)) < cutoff:
+            paid_sessions.pop(sid, None)
+    for tok in list(issued_tokens.keys()):
+        if int(issued_tokens[tok].get("created", 0)) < cutoff:
+            issued_tokens.pop(tok, None)
+
+
+def _make_access_token(session_id: str) -> str:
+    raw = f"{session_id}:{TOKEN_SALT}:{_now()}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _extract_bearer(request: Request) -> str:
+    auth = request.headers.get("authorization", "").strip()
+    if auth.lower().startswith("bearer "):
+        return auth.split(" ", 1)[1].strip()
+    return ""
+
+
+def _require_api_key_or_paid_token(request: Request) -> Dict[str, Any]:
+    """
+    允许两种方式通过：
+    1) X-API-Key: <your_key>  (在 APP_API_KEYS 白名单中)
+    2) Authorization: Bearer <token>  (由 /success 发放)
+    """
+    _cleanup_cache()
+
+    # 方式1：自定义 API Key
+    api_key = request.headers.get("x-api-key", "").strip()
+    if api_key and (not APP_API_KEYS or api_key in APP_API_KEYS):
+        return {"mode": "api_key", "api_key": api_key}
+
+    # 方式2：Stripe 支付后 token
+    token = _extract_bearer(request)
+    if token and token in issued_tokens:
+        return {"mode": "paid_token", "token": token, "session_id": issued_tokens[token]["session_id"]}
+
+    raise HTTPException(status_code=401, detail="Unauthorized. Provide X-API-Key or Bearer token.")
+
+
+def _stripe_retrieve_session(session_id: str) -> Dict[str, Any]:
+    if not stripe_configured:
+        raise HTTPException(status_code=500, detail="Stripe not configured. Check STRIPE_SECRET_KEY / PAYMENT_MODE.")
+    try:
+        sess = stripe.checkout.Session.retrieve(session_id)
+        # sess 是 stripe object，转 dict
+        return json.loads(str(sess))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid session_id or Stripe error: {str(e)}")
+
+
+def _stripe_is_paid(session: Dict[str, Any]) -> bool:
+    # Stripe checkout session 常用字段：
+    # payment_status: "paid" / "unpaid"
+    return str(session.get("payment_status", "")).lower() == "paid"
+
+
+# =========================
+# Pydantic models
+# =========================
 class AnalyzeRequest(BaseModel):
-    # 你之前问的 AnalyzeRequest 就在这里
-    route: str = Field(..., description="Route string, e.g. Shanghai -> Auckland or 'CN-SHA to NZ-AKL'")
-    cargo: Optional[str] = Field(None, description="Cargo description")
-    incoterm: Optional[str] = Field(None, description="INCOTERM, e.g. FOB/CIF/DDP")
-    amount_usd: Optional[float] = Field(None, description="Order amount in USD")
-    horizon_days: int = Field(90, ge=7, le=365, description="Risk horizon in days")
-    notes: Optional[str] = Field(None, description="Any extra notes")
+    """你问的 AnalyzeRequest 在这里（Pydantic Model）"""
+    route: str = Field(..., description="Route or scenario description, e.g. 'Shanghai->Mumbai, lithium battery materials'")
+    context: Optional[str] = Field(None, description="Extra context: ports, suppliers, HS codes, Incoterms, etc.")
+    horizon_days: int = Field(90, ge=1, le=365, description="Risk horizon in days")
+    max_signals: int = Field(MAX_SIGNALS, ge=1, le=30, description="How many signals to return")
+
 
 class AnalyzeResponse(BaseModel):
-    ok: bool
-    mode: str
-    paid: bool
+    status: str
     version: str
+    mode: str
     result: Dict[str, Any]
 
-# ---------------------------
-# Auth / helpers
-# ---------------------------
-def _require_api_key(req: FastAPIRequest):
-    if not APP_API_KEYS:
-        return
-    # allow either header or query
-    k = req.headers.get("x-api-key") or req.query_params.get("api_key")
-    if not k or k not in APP_API_KEYS:
-        raise HTTPException(status_code=401, detail="Unauthorized: invalid API key")
 
-def _sha256(s: str) -> str:
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+# =========================
+# App
+# =========================
+app = FastAPI(title="Global Risk API", version=APP_VERSION)
 
-def _make_unlock_token(session_id: str) -> str:
-    # deterministic token bound to session_id
-    return _sha256(f"{session_id}::{TOKEN_SALT}")
 
-def _cache_get(key: str) -> Optional[Dict[str, Any]]:
-    hit = _cache.get(key)
-    if not hit:
-        return None
-    if time.time() - hit["ts"] > CACHE_TTL_SECONDS:
-        _cache.pop(key, None)
-        return None
-    return hit["data"]
-
-def _cache_set(key: str, data: Dict[str, Any]):
-    _cache[key] = {"ts": time.time(), "data": data}
-
-# ---------------------------
-# Stripe verification
-# ---------------------------
-def stripe_is_ready() -> bool:
-    return bool(STRIPE_SECRET_KEY)
-
-def verify_stripe_session_paid(session_id: str) -> Dict[str, Any]:
-    """
-    Returns dict with:
-      paid: bool
-      currency, amount_total
-      customer_details (email) if available
-    """
-    if not stripe_is_ready():
-        raise HTTPException(status_code=500, detail="Stripe is not configured (missing STRIPE_SECRET_KEY).")
-
-    cache_key = f"stripe_session::{session_id}"
-    cached = _cache_get(cache_key)
-    if cached:
-        return cached
-
-    try:
-        # Payment Links create Checkout Sessions
-        sess = stripe.checkout.Session.retrieve(
-            session_id,
-            expand=["line_items", "customer_details"]
-        )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid session_id: {str(e)}")
-
-    paid = (sess.get("payment_status") == "paid") or (sess.get("status") == "complete")
-
-    data = {
-        "paid": bool(paid),
-        "currency": sess.get("currency"),
-        "amount_total": sess.get("amount_total"),
-        "customer_email": (sess.get("customer_details") or {}).get("email"),
-        "id": sess.get("id"),
-    }
-    _cache_set(cache_key, data)
-    return data
-
-def is_unlock_token_valid(token: str, session_id: str) -> bool:
-    return token == _make_unlock_token(session_id)
-
-# ---------------------------
-# Routes
-# ---------------------------
 @app.get("/")
 def root():
-    # Render 常会 HEAD / 探活；给 200，避免 404 造成误解
-    return {"status": "ok", "service": "global-risk-api", "version": APP_VERSION}
+    # 你访问主域名时不再是 404
+    return {
+        "status": "ok",
+        "service": "global-risk-api",
+        "version": APP_VERSION,
+        "endpoints": ["/health", "/analyze", "/success", "/cancel"],
+    }
+
 
 @app.get("/health")
 def health():
     return {
         "status": "ok",
         "version": APP_VERSION,
-        "openai_configured": bool(_openai_client),
+        "openai_configured": bool(openai_configured),
         "payment_mode": PAYMENT_MODE,
-        "stripe_configured": stripe_is_ready(),
-        "max_signals": MAX_SIGNALS,
+        "stripe_configured": bool(stripe_configured),
     }
 
-@app.get("/cancel")
-def cancel():
-    # 你可以在 Stripe Payment Link 里把 cancel_url 指到这里
-    return HTMLResponse(
-        "<h3>Payment cancelled</h3><p>You cancelled the payment. You can close this page.</p>"
-    )
 
+# =========================
+# Stripe return URLs
+# =========================
 @app.get("/success")
-def success(session_id: str):
+def stripe_success(session_id: str):
     """
-    Stripe Payment Link 成功后跳转到：
+    Stripe Payment Link 的确认页 URL 建议设置到：
     https://global-risk-api.onrender.com/success?session_id={CHECKOUT_SESSION_ID}
 
-    注意：如果你这里之前 404，说明你部署的 app.py 根本没有这个路由生效。
+    这个接口会：
+    1) 去 Stripe 拉取 session
+    2) 校验 payment_status == paid
+    3) 生成一个 Bearer token（有效期受 CACHE_TTL_SECONDS 影响）
     """
-    info = verify_stripe_session_paid(session_id)
-    if not info["paid"]:
-        return HTMLResponse(
-            f"<h3>Payment not completed</h3><p>session_id={quote(session_id)}</p>",
-            status_code=402,
-        )
+    _cleanup_cache()
 
-    unlock_token = _make_unlock_token(session_id)
+    if PAYMENT_MODE != "stripe":
+        return {"status": "ok", "note": "PAYMENT_MODE is not stripe", "version": APP_VERSION}
 
-    # 返回一个清晰的“下一步怎么用”的页面
-    html = f"""
-    <html>
-      <body style="font-family: Arial, sans-serif; padding: 24px;">
-        <h2>✅ Payment Success</h2>
-        <p><b>session_id</b>: {quote(session_id)}</p>
-        <p><b>amount</b>: {info.get("amount_total")} {info.get("currency")}</p>
-        <p><b>customer</b>: {info.get("customer_email") or "-"}</p>
-        <hr/>
-        <h3>Next Step</h3>
-        <p>Use this unlock token to call the API:</p>
-        <pre style="background:#f4f4f4;padding:12px;border-radius:8px;">{unlock_token}</pre>
+    sess = _stripe_retrieve_session(session_id)
+    if not _stripe_is_paid(sess):
+        raise HTTPException(status_code=402, detail="Payment not completed (payment_status != paid).")
 
-        <p><b>Example request</b> (POST /v1/analyze):</p>
-        <pre style="background:#f4f4f4;padding:12px;border-radius:8px;">
-Headers:
-  x-api-key: (optional, if you set APP_API_KEYS)
-Body:
-{json.dumps({"route":"Shanghai -> Auckland","cargo":"battery materials","incoterm":"CIF","amount_usd":100000,"horizon_days":90,"notes":"test"}, indent=2)}
-Query:
-  ?session_id={quote(session_id)}&unlock_token={unlock_token}
-        </pre>
+    email = (sess.get("customer_details") or {}).get("email")
+    amount_total = sess.get("amount_total")
+    currency = sess.get("currency")
 
-        <p>You can close this page.</p>
-      </body>
-    </html>
-    """
-    return HTMLResponse(html)
-
-@app.post("/v1/analyze", response_model=AnalyzeResponse)
-async def analyze(req: FastAPIRequest, payload: AnalyzeRequest):
-    """
-    Freemium 逻辑：
-    - PAYMENT_MODE=off: 不校验支付，直接返回
-    - PAYMENT_MODE=stripe: 允许两种方式解锁：
-        A) session_id + unlock_token (来自 /success 页面)
-        B) session_id (服务端实时验证 paid，unlock_token 可选但建议用)
-    """
-    _require_api_key(req)
-
-    paid = False
-    mode = PAYMENT_MODE
-
-    session_id = req.query_params.get("session_id", "").strip()
-    unlock_token = req.query_params.get("unlock_token", "").strip()
-
-    if mode == "stripe":
-        if not session_id:
-            # 没给 session_id：走 freemium（有限结果）
-            paid = False
-        else:
-            # 有 session_id：校验
-            info = verify_stripe_session_paid(session_id)
-            if info["paid"]:
-                # 如果提供 unlock_token，则再多一层一致性校验（防止别人随便拿 session_id 调用）
-                if unlock_token and not is_unlock_token_valid(unlock_token, session_id):
-                    raise HTTPException(status_code=401, detail="Invalid unlock_token for this session_id.")
-                paid = True
-            else:
-                paid = False
-
-    # -----------------------
-    # Core logic (demo)
-    # -----------------------
-    # freemium 限制：只返回少量信号，不调用 LLM（或可调用但建议省钱）
-    if not paid:
-        result = {
-            "tier": "freemium",
-            "route": payload.route,
-            "horizon_days": payload.horizon_days,
-            "signals": [
-                {"key": "port_congestion", "level": "medium"},
-                {"key": "fx_volatility", "level": "medium"},
-                {"key": "geopolitical", "level": "low"},
-            ][: max(1, min(3, MAX_SIGNALS))],
-            "note": "Freemium result. Provide a paid session_id to unlock full report.",
-        }
-        return AnalyzeResponse(ok=True, mode=mode, paid=False, version=APP_VERSION, result=result)
-
-    # paid：允许调用 OpenAI 生成更完整报告（如果没配置 OpenAI 也能返回结构化结果）
-    base = {
-        "tier": "paid",
-        "route": payload.route,
-        "cargo": payload.cargo,
-        "incoterm": payload.incoterm,
-        "amount_usd": payload.amount_usd,
-        "horizon_days": payload.horizon_days,
-        "dimensions": [
-            "geopolitical", "regulatory", "port", "carrier", "weather",
-            "fx", "supplier", "fraud"
-        ],
+    paid_sessions[session_id] = {
+        "paid": True,
+        "created": _now(),
+        "email": email,
+        "amount_total": amount_total,
+        "currency": currency,
     }
 
-    if not _openai_client:
-        base["note"] = "Paid verified, but OpenAI not configured. Returning non-LLM report scaffold."
-        base["risk_score"] = 62
-        base["recommendations"] = [
-            "Add buffer days to ETA and define fallback port.",
-            "Add payment terms risk premium or use LC/DP where needed.",
-            "Lock FX rate for 30–60 days if margin is thin."
-        ]
-        return AnalyzeResponse(ok=True, mode=mode, paid=True, version=APP_VERSION, result=base)
+    token = _make_access_token(session_id)
+    issued_tokens[token] = {"session_id": session_id, "created": _now()}
 
-    # LLM call (kept minimal; you can harden later)
+    # 你可以改成 Redirect 到你的前端页面：
+    # return RedirectResponse(url=f"https://your-frontend.com/paid?token={token}")
+    return {
+        "status": "ok",
+        "version": APP_VERSION,
+        "message": "Payment verified. Use this token to call /analyze with Authorization: Bearer <token>",
+        "token": token,
+        "session_id": session_id,
+        "email": email,
+        "amount_total": amount_total,
+        "currency": currency,
+        "ttl_seconds": CACHE_TTL_SECONDS,
+    }
+
+
+@app.get("/cancel")
+def stripe_cancel():
+    return {
+        "status": "ok",
+        "version": APP_VERSION,
+        "message": "Payment canceled or not completed.",
+    }
+
+
+# （可选）如果你后续要做 webhook：更可靠、不会因 Render 重启丢失状态
+@app.post("/stripe/webhook")
+async def stripe_webhook(request: Request):
+    if not STRIPE_WEBHOOK_SECRET:
+        raise HTTPException(status_code=500, detail="STRIPE_WEBHOOK_SECRET not set.")
+
+    payload = await request.body()
+    sig_header = request.headers.get("stripe-signature", "")
+
+    try:
+        event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Webhook signature verification failed: {str(e)}")
+
+    # 你可以在这里处理 checkout.session.completed 等事件
+    return {"received": True, "type": event.get("type")}
+
+
+# =========================
+# Business endpoint
+# =========================
+@app.post("/analyze", response_model=AnalyzeResponse)
+def analyze(req: AnalyzeRequest, request: Request):
+    """
+    调用方式：
+    - 付费后：Authorization: Bearer <token>
+    - 或者你自己给客户发：X-API-Key: <key>
+    """
+    auth = _require_api_key_or_paid_token(request)
+
+    if not openai_configured or client is None:
+        raise HTTPException(status_code=500, detail="OpenAI not configured. Set OPENAI_API_KEY.")
+
+    # 简单示例：让模型输出结构化风险要点（你后续可以换成你的 risk engine）
     prompt = f"""
 You are a supply-chain risk analyst.
-Return a JSON object ONLY.
-
-Input:
-route={payload.route}
-cargo={payload.cargo}
-incoterm={payload.incoterm}
-amount_usd={payload.amount_usd}
-horizon_days={payload.horizon_days}
-notes={payload.notes}
-
-Required JSON keys:
-risk_score (0-100 int),
-top_risks (array of 8 items: key, level, rationale),
-recommendations (array of 5 items),
-assumptions (array).
+Return a JSON object with:
+- summary (string)
+- horizon_days (int)
+- key_risks (array of objects: name, likelihood_0_1, impact_0_10, notes)
+- suggested_actions (array of strings)
+Constraints:
+- max key_risks = {min(req.max_signals, 30)}
+Route/scenario: {req.route}
+Context: {req.context or ""}
+Horizon days: {req.horizon_days}
 """
 
     try:
-        resp = _openai_client.chat.completions.create(
+        rsp = client.chat.completions.create(
             model=LLM_MODEL,
             messages=[
-                {"role": "system", "content": "You output strict JSON only."},
+                {"role": "system", "content": "Return strictly valid JSON, no markdown, no extra text."},
                 {"role": "user", "content": prompt},
             ],
             temperature=0.2,
         )
-        text = resp.choices[0].message.content or "{}"
-        # be defensive
-        llm_json = json.loads(text)
+        content = rsp.choices[0].message.content or "{}"
+        result = json.loads(content)
+    except json.JSONDecodeError:
+        # 兜底：避免模型偶发不严格 JSON
+        result = {
+            "summary": "Model output was not valid JSON; returning raw text.",
+            "raw": (rsp.choices[0].message.content if 'rsp' in locals() else None),
+        }
     except Exception as e:
-        llm_json = {"error": f"LLM failure: {str(e)}"}
+        raise HTTPException(status_code=500, detail=f"Analyze failed: {str(e)}")
 
-    result = {**base, **llm_json}
-    return AnalyzeResponse(ok=True, mode=mode, paid=True, version=APP_VERSION, result=result)
-
-# ---------------------------
-# Error handler (optional)
-# ---------------------------
-@app.exception_handler(HTTPException)
-async def http_exception_handler(_: FastAPIRequest, exc: HTTPException):
-    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+    return AnalyzeResponse(
+        status="ok",
+        version=APP_VERSION,
+        mode=auth["mode"],
+        result=result,
+    )
