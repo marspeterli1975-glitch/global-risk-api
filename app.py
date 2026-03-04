@@ -1,93 +1,86 @@
-"""
-app.py — SCRS FastAPI (full replace)
-
-Features
-- /health : health check
-- /analyze : protected (X-API-Key OR Authorization token/Bearer token)
-- /success : Stripe redirect landing — verifies session_id, issues short-lived paid token, returns HTML that stores token and can auto-call /analyze
-- Optional /create-checkout-session : create Stripe checkout session (useful if you later want your own pay button)
-
-Auth rules
-- Provide either:
-  A) Header: X-API-Key: <your_api_key>
-  OR
-  B) Header: Authorization: Bearer <paid_token>   (also accepts Authorization: <paid_token>)
-
-ENV you should set on Render
-- APP_VERSION="0.4.0-scrs-freemium"
-- TOKEN_SECRET="a_long_random_secret"          # REQUIRED for paid token signing
-- API_KEYS="peterbingli-202602-risk-001"       # optional; comma-separated
-- STRIPE_SECRET_KEY="sk_test_..."              # REQUIRED for /success (verify checkout session)
-- STRIPE_PRICE_ID="price_..."                  # optional; for /create-checkout-session
-- SUCCESS_URL="https://global-risk-api.onrender.com/success?session_id={CHECKOUT_SESSION_ID}"
-- CANCEL_URL="https://global-risk-api.onrender.com/cancel"
-- PAID_TOKEN_TTL_SECONDS="900"                 # default 900s
-- CORS_ALLOW_ORIGINS="*"                       # or comma-separated origins
-
-Run (Render)
-- Start command: uvicorn app:app --host 0.0.0.0 --port 10000
-"""
-
-from __future__ import annotations
-
-import base64
-import hashlib
-import hmac
-import json
 import os
 import time
-import uuid
-from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+import json
+import secrets
+from typing import Optional, List, Dict, Any
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse
+from pydantic import BaseModel, Field
 
-# Stripe is optional at import time; /success needs it
-try:
-    import stripe  # type: ignore
-except Exception:
-    stripe = None
+import stripe
+import jwt
 
 
 # =========================
-# Config
+# Env helpers
 # =========================
 
-APP_VERSION = os.getenv("APP_VERSION", "0.4.0-scrs-freemium")
+def _get_env(name: str, default: Optional[str] = None) -> str:
+    v = os.getenv(name, default)
+    return v if v is not None else (default or "")
 
-TOKEN_SECRET = os.getenv("TOKEN_SECRET", "")  # REQUIRED for signing paid tokens
-API_KEYS_RAW = os.getenv("API_KEYS", "").strip()
-API_KEYS = {k.strip() for k in API_KEYS_RAW.split(",") if k.strip()}
+def _get_bool(name: str, default: bool = False) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "y", "on")
 
-STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "").strip()
-STRIPE_PRICE_ID = os.getenv("STRIPE_PRICE_ID", "").strip()
+def _split_keys(v: str) -> List[str]:
+    if not v:
+        return []
+    # allow commas / newlines / spaces
+    raw = v.replace("\n", ",").replace(" ", ",")
+    return [x.strip() for x in raw.split(",") if x.strip()]
 
-SUCCESS_URL = os.getenv(
-    "SUCCESS_URL",
-    "https://global-risk-api.onrender.com/success?session_id={CHECKOUT_SESSION_ID}",
-).strip()
-CANCEL_URL = os.getenv("CANCEL_URL", "https://global-risk-api.onrender.com/cancel").strip()
-
-PAID_TOKEN_TTL_SECONDS = int(os.getenv("PAID_TOKEN_TTL_SECONDS", "900").strip() or "900")
-
-CORS_ALLOW_ORIGINS_RAW = os.getenv("CORS_ALLOW_ORIGINS", "*").strip()
-if CORS_ALLOW_ORIGINS_RAW == "*":
-    CORS_ALLOW_ORIGINS = ["*"]
-else:
-    CORS_ALLOW_ORIGINS = [o.strip() for o in CORS_ALLOW_ORIGINS_RAW.split(",") if o.strip()]
+def _now() -> int:
+    return int(time.time())
 
 
 # =========================
-# App
+# Configuration
 # =========================
 
-app = FastAPI(title="SCRS API", version=APP_VERSION)
+APP_NAME = _get_env("APP_NAME", "global-risk-api")
+DEBUG = _get_bool("DEBUG", False)
+
+STRIPE_SECRET_KEY = _get_env("STRIPE_SECRET_KEY", "")
+OPENAI_API_KEY = _get_env("OPENAI_API_KEY", "")  # 你后面接 LLM 用
+LLM_MODEL = _get_env("LLM_MODEL", "gpt-4o-mini")  # 可改
+PAYMENT_MODE = _get_env("PAYMENT_MODE", "stripe_payment_link")  # 预留
+
+# API keys (static)
+API_KEYS = _split_keys(_get_env("API_KEYS", ""))  # 新变量
+API_KEYS += _split_keys(_get_env("APP_API_KEYS", ""))  # 兼容旧变量
+API_KEYS = list(dict.fromkeys(API_KEYS))  # 去重保序
+
+# Paid token signing secret
+TOKEN_SECRET = _get_env("TOKEN_SECRET", "")
+if not TOKEN_SECRET:
+    # 没配就临时生成（不建议：重启后 token 会失效）
+    TOKEN_SECRET = secrets.token_hex(16)
+
+# URLs
+SUCCESS_URL = _get_env("SUCCESS_URL", "https://global-risk-api.onrender.com/success?session_id={CHECKOUT_SESSION_ID}")
+CANCEL_URL = _get_env("CANCEL_URL", "https://global-risk-api.onrender.com/cancel")
+
+# TTL
+PAID_TOKEN_TTL_SECONDS = int(_get_env("PAID_TOKEN_TTL_SECONDS", "900") or "900")
+
+# Stripe init
+if STRIPE_SECRET_KEY:
+    stripe.api_key = STRIPE_SECRET_KEY
+
+
+# =========================
+# FastAPI app
+# =========================
+
+app = FastAPI(title=APP_NAME, version="0.4.0-scrs-freemium")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=CORS_ALLOW_ORIGINS,
+    allow_origins=["*"],  # 你后面有官网再收紧
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -95,558 +88,224 @@ app.add_middleware(
 
 
 # =========================
-# In-memory token store
+# Schemas
 # =========================
 
-@dataclass
-class TokenRecord:
-    token: str
-    session_id: str
-    email: str
-    amount_total: int
-    currency: str
-    issued_at: int
-    expires_at: int
+class AnalyzeRequest(BaseModel):
+    route: str = Field(..., example="Shanghai -> Tokyo")
+    context: str = Field(..., example="Lithium battery materials, CIF")
+    horizon_days: int = Field(90, ge=1, le=365)
+    language: str = Field("en", pattern="^(en|zh)$")
 
 
-# token -> record
-ISSUED_TOKENS: Dict[str, TokenRecord] = {}
+class AnalyzeResponse(BaseModel):
+    status: str
+    version: str
+    mode: str
+    result: Dict[str, Any]
 
 
-def _now() -> int:
-    return int(time.time())
+# =========================
+# Auth
+# =========================
 
+def _unauthorized(detail: str = "Unauthorized. Provide X-API-Key or Bearer token."):
+    raise HTTPException(status_code=401, detail=detail)
 
-def _b64url(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).decode("utf-8").rstrip("=")
-
-
-def _b64url_decode(s: str) -> bytes:
-    pad = "=" * ((4 - (len(s) % 4)) % 4)
-    return base64.urlsafe_b64decode((s + pad).encode("utf-8"))
-
-
-def _hmac_sha256(key: bytes, msg: bytes) -> bytes:
-    return hmac.new(key, msg, hashlib.sha256).digest()
-
-
-def _sign_token(payload: dict) -> str:
-    """
-    Token format: base64url(payload_json).base64url(sig)
-    """
-    if not TOKEN_SECRET:
-        raise RuntimeError("TOKEN_SECRET is missing")
-
-    payload_bytes = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-    body = _b64url(payload_bytes).encode("utf-8")
-    sig = _b64url(_hmac_sha256(TOKEN_SECRET.encode("utf-8"), body))
-    return f"{body.decode('utf-8')}.{sig}"
-
-
-def _verify_token(token: str) -> Tuple[bool, Optional[dict]]:
-    if not TOKEN_SECRET:
-        return False, None
-
-    if "." not in token:
-        return False, None
-
-    body_b64, sig_b64 = token.split(".", 1)
-    body_bytes = body_b64.encode("utf-8")
-    expected_sig = _b64url(_hmac_sha256(TOKEN_SECRET.encode("utf-8"), body_bytes))
-
-    # constant-time compare
-    if not hmac.compare_digest(expected_sig, sig_b64):
-        return False, None
-
-    try:
-        payload = json.loads(_b64url_decode(body_b64).decode("utf-8"))
-        return True, payload
-    except Exception:
-        return False, None
-
-
-def _clean_expired_tokens() -> None:
-    now = _now()
-    expired = [t for t, rec in ISSUED_TOKENS.items() if rec.expires_at <= now]
-    for t in expired:
-        ISSUED_TOKENS.pop(t, None)
-
-
-def issue_paid_token(*, session_id: str, email: str, amount_total: int, currency: str) -> TokenRecord:
-    _clean_expired_tokens()
-
-    issued_at = _now()
-    expires_at = issued_at + PAID_TOKEN_TTL_SECONDS
-
-    payload = {
-        "typ": "scrs_paid",
-        "sid": session_id,
-        "iat": issued_at,
-        "exp": expires_at,
-        "jti": uuid.uuid4().hex,
-        "email": email or "",
-        "amt": int(amount_total or 0),
-        "cur": (currency or "").lower(),
-        "v": APP_VERSION,
-    }
-
-    token = _sign_token(payload)
-
-    rec = TokenRecord(
-        token=token,
-        session_id=session_id,
-        email=email or "",
-        amount_total=int(amount_total or 0),
-        currency=(currency or "").lower(),
-        issued_at=issued_at,
-        expires_at=expires_at,
-    )
-
-    ISSUED_TOKENS[token] = rec
-    return rec
-
-
-def _extract_auth_token(authorization: Optional[str]) -> Optional[str]:
-    """
-    Accept:
-    - "Bearer <token>"
-    - "<token>" (raw)
-    """
+def _extract_bearer(authorization: Optional[str]) -> Optional[str]:
     if not authorization:
         return None
-    auth = authorization.strip()
-    if not auth:
-        return None
-    parts = auth.split(None, 1)
+    parts = authorization.strip().split(" ", 1)
     if len(parts) == 2 and parts[0].lower() == "bearer":
         return parts[1].strip()
-    return auth
+    # allow "just token" in Authorization header (some tools do this)
+    if len(parts) == 1 and parts[0]:
+        return parts[0].strip()
+    return None
 
+def _verify_static_key(token_or_key: str) -> bool:
+    return bool(token_or_key) and (token_or_key in API_KEYS)
 
-def _require_auth(
-    *,
-    x_api_key: Optional[str],
+def _decode_paid_token(token: str) -> Dict[str, Any]:
+    try:
+        payload = jwt.decode(token, TOKEN_SECRET, algorithms=["HS256"])
+        return payload
+    except jwt.ExpiredSignatureError:
+        _unauthorized("Unauthorized. Token expired.")
+    except Exception:
+        _unauthorized("Unauthorized. Invalid token.")
+
+def require_auth(
     authorization: Optional[str],
-) -> dict:
+    x_api_key: Optional[str]
+) -> Dict[str, Any]:
     """
-    Returns auth context dict if authorized, else raises 401.
+    Accept:
+    - X-API-Key: <static key>
+    - Authorization: Bearer <static key>   (also accepted)
+    - Authorization: Bearer <paid_jwt>     (paid token)
     """
-    # 1) Master API key path
-    if x_api_key and x_api_key.strip() and (not API_KEYS or x_api_key.strip() in API_KEYS):
-        return {"mode": "api_key", "principal": "api_key"}
+    # 1) X-API-Key
+    if x_api_key and _verify_static_key(x_api_key):
+        return {"mode": "api_key", "key": x_api_key}
 
-    # 2) Token path
-    tok = _extract_auth_token(authorization)
-    if not tok:
-        raise HTTPException(status_code=401, detail="Unauthorized. Provide X-API-Key or Bearer token.")
+    # 2) Bearer
+    bearer = _extract_bearer(authorization)
+    if bearer:
+        if _verify_static_key(bearer):
+            return {"mode": "api_key", "key": bearer}
+        # else treat as paid jwt
+        payload = _decode_paid_token(bearer)
+        if payload.get("type") != "paid_token":
+            _unauthorized("Unauthorized. Invalid token type.")
+        return {"mode": "paid_token", "claims": payload}
 
-    # First validate signature & expiry
-    ok, payload = _verify_token(tok)
-    if not ok or not payload:
-        raise HTTPException(status_code=401, detail="Unauthorized. Invalid token.")
-
-    exp = int(payload.get("exp") or 0)
-    if exp <= _now():
-        raise HTTPException(status_code=401, detail="Unauthorized. Token expired.")
-
-    # Optional: require it exists in our issued store (prevents random signed token reuse if you rotate)
-    rec = ISSUED_TOKENS.get(tok)
-    if not rec:
-        # If you want to allow stateless tokens only, comment out this block.
-        raise HTTPException(status_code=401, detail="Unauthorized. Token not recognized.")
-
-    return {
-        "mode": "paid_token",
-        "principal": payload.get("email") or "paid_user",
-        "session_id": payload.get("sid"),
-        "expires_at": exp,
-    }
-
-
-# =========================
-# Helpers: risk analysis (simple baseline)
-# =========================
-
-def _simple_risk_engine(route: str, context: str, horizon_days: int, language: str = "en") -> dict:
-    """
-    Replace this function with your real risk engine / OpenAI calls.
-    Keep deterministic-ish and structured.
-    """
-    route_l = (route or "").lower()
-    context_l = (context or "").lower()
-    horizon_days = int(horizon_days or 30)
-
-    # Baseline factors
-    base = 0.55
-    if "lithium" in context_l or "battery" in context_l:
-        base += 0.10
-    if "cif" in context_l:
-        base += 0.05
-    if "shanghai" in route_l and "tokyo" in route_l:
-        base += 0.05
-    if horizon_days >= 90:
-        base += 0.05
-
-    base = max(0.05, min(0.95, base))
-
-    # Build 3 risks
-    risks = [
-        {
-            "name": "Geopolitical Tensions" if language == "en" else "地缘政治紧张",
-            "likelihood_0_1": round(min(0.95, base + 0.10), 2),
-            "impact_0_10": 8,
-            "notes": "Potential trade restrictions / policy swings could affect routing and customs." if language == "en"
-            else "潜在贸易限制/政策波动可能影响航线与通关。",
-        },
-        {
-            "name": "Regulatory Changes" if language == "en" else "监管变动",
-            "likelihood_0_1": round(min(0.95, base + 0.00), 2),
-            "impact_0_10": 7,
-            "notes": "Changes in import/export compliance (e.g., batteries/chemicals) may introduce delays." if language == "en"
-            else "进出口合规（电池/化学品）要求变化可能带来延误。",
-        },
-        {
-            "name": "Supply Disruptions" if language == "en" else "供应扰动",
-            "likelihood_0_1": round(min(0.95, base - 0.05), 2),
-            "impact_0_10": 7,
-            "notes": "Port congestion, carrier blank sailings, or upstream disruptions can shift ETD/ETA." if language == "en"
-            else "港口拥堵、停航或上游扰动会影响ETD/ETA。",
-        },
-    ]
-
-    overall = sum(r["likelihood_0_1"] * (r["impact_0_10"] / 10) for r in risks) / len(risks)
-    overall = round(overall, 2)
-
-    if language == "en":
-        summary = (
-            f"The supply chain route '{route}' faces moderate-to-elevated risk over {horizon_days} days. "
-            f"Key drivers include policy/regulatory uncertainty and disruption volatility."
-        )
-    else:
-        summary = (
-            f"航线“{route}”在未来{horizon_days}天面临中等偏高风险，主要驱动来自政策/监管不确定性与扰动波动。"
-        )
-
-    return {
-        "summary": summary,
-        "horizon_days": horizon_days,
-        "route": route,
-        "context": context,
-        "overall_risk_0_1": overall,
-        "key_risks": risks,
-        "recommended_actions": (
-            [
-                "Pre-book capacity and set contingency routing." ,
-                "Lock compliance checklist for dangerous goods / batteries.",
-                "Build buffer stock for critical SKUs; monitor port/carrier alerts.",
-            ]
-            if language == "en"
-            else
-            [
-                "提前订舱并准备备选航线。",
-                "固化危险品/电池合规清单并前置审核。",
-                "关键SKU设置安全库存缓冲，持续监测港口/船司预警。",
-            ]
-        ),
-    }
+    _unauthorized()
 
 
 # =========================
 # Routes
 # =========================
 
-@app.get("/", response_class=JSONResponse)
-def home() -> dict:
-    # You previously saw {"detail":"Not Found"} on root; returning a minimal payload is usually nicer.
-    return {
-        "status": "ok",
-        "service": "scrs-api",
-        "version": APP_VERSION,
-        "endpoints": ["/health", "/analyze", "/success"],
-    }
+@app.get("/health")
+def health():
+    return {"status": "ok", "app": APP_NAME, "version": app.version}
 
 
-@app.get("/health", response_class=JSONResponse)
-def health() -> dict:
-    stripe_configured = bool(STRIPE_SECRET_KEY)
-    return {
-        "status": "ok",
-        "version": APP_VERSION,
-        "payment_mode": "stripe",
-        "stripe_configured": stripe_configured,
-    }
+@app.get("/cancel")
+def cancel():
+    return {"status": "ok", "message": "Payment cancelled. You can close this page."}
 
 
-@app.post("/analyze", response_class=JSONResponse)
-async def analyze(
-    request: Request,
-    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
-    authorization: Optional[str] = Header(default=None, alias="Authorization"),
-) -> dict:
-    auth_ctx = _require_auth(x_api_key=x_api_key, authorization=authorization)
-
-    body = await request.json()
-    # Accept both old and new param names
-    route = body.get("route") or body.get("location") or ""
-    context = body.get("context") or body.get("notes") or ""
-    horizon_days = body.get("horizon_days") or body.get("horizonDays") or 90
-    language = body.get("language") or "en"
-
-    req_id = uuid.uuid4().hex[:12]
-
-    result = _simple_risk_engine(
-        route=str(route),
-        context=str(context),
-        horizon_days=int(horizon_days),
-        language=str(language).lower(),
-    )
-
-    return {
-        "status": "ok",
-        "version": APP_VERSION,
-        "mode": auth_ctx.get("mode"),
-        "request_id": req_id,
-        "auth": {
-            "principal": auth_ctx.get("principal"),
-            "session_id": auth_ctx.get("session_id"),
-            "expires_at": auth_ctx.get("expires_at"),
-        },
-        "result": result,
-    }
-
-
-@app.get("/success", response_class=JSONResponse)
-def success(session_id: str) -> Any:
+@app.get("/success")
+def success(session_id: str):
     """
-    Stripe redirects here as:
-    /success?session_id={CHECKOUT_SESSION_ID}
-
-    We verify checkout session, issue paid token, then return an HTML page:
-    - stores token in localStorage
-    - offers button to POST /analyze
-    - can auto-run analyze if desired
+    Stripe Payment Link return URL should include:
+      ?session_id={CHECKOUT_SESSION_ID}
+    We verify checkout.session and issue a short-lived paid token (JWT).
     """
-    if not session_id:
-        raise HTTPException(status_code=400, detail="Missing session_id")
-
-    if stripe is None:
-        raise HTTPException(status_code=500, detail="Stripe library not installed")
-
     if not STRIPE_SECRET_KEY:
-        raise HTTPException(status_code=500, detail="STRIPE_SECRET_KEY not configured")
+        raise HTTPException(status_code=500, detail="Stripe is not configured (missing STRIPE_SECRET_KEY).")
 
-    stripe.api_key = STRIPE_SECRET_KEY
+    if not session_id or not session_id.startswith("cs_"):
+        raise HTTPException(status_code=400, detail="Invalid session_id (expected cs_...).")
 
     try:
-        # Expand customer_details for email; expand payment_intent if you want
-        sess = stripe.checkout.Session.retrieve(
-            session_id,
-            expand=["customer_details"],
-        )
+        sess = stripe.checkout.Session.retrieve(session_id)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid session_id or Stripe error: {str(e)}")
 
-    # Stripe test/live differs, but generally: status == "complete" and/or payment_status == "paid"
-    status = getattr(sess, "status", None) or ""
-    payment_status = getattr(sess, "payment_status", None) or ""
+    # Stripe session checks
+    # payment_status: 'paid' (common), status: 'complete' (depends)
+    payment_status = getattr(sess, "payment_status", None) or sess.get("payment_status")
+    status = getattr(sess, "status", None) or sess.get("status")
 
-    if (status != "complete") and (payment_status != "paid"):
-        raise HTTPException(
-            status_code=402,
-            detail=f"Payment not complete. status={status}, payment_status={payment_status}",
-        )
+    if payment_status != "paid" and status != "complete":
+        raise HTTPException(status_code=402, detail=f"Payment not completed. payment_status={payment_status}, status={status}")
 
-    customer_details = getattr(sess, "customer_details", None)
-    email = ""
-    if customer_details and getattr(customer_details, "email", None):
-        email = customer_details.email or ""
+    customer_details = getattr(sess, "customer_details", None) or sess.get("customer_details") or {}
+    email = customer_details.get("email") or ""
 
-    amount_total = int(getattr(sess, "amount_total", 0) or 0)
-    currency = str(getattr(sess, "currency", "usd") or "usd")
+    amount_total = getattr(sess, "amount_total", None) or sess.get("amount_total") or 0
+    currency = getattr(sess, "currency", None) or sess.get("currency") or "usd"
 
-    rec = issue_paid_token(
-        session_id=session_id,
-        email=email,
-        amount_total=amount_total,
-        currency=currency,
-    )
+    iat = _now()
+    exp = iat + PAID_TOKEN_TTL_SECONDS
 
-    # IMPORTANT: You can choose JSON or HTML.
-    # For end users, HTML is better. If you want JSON-only, return dict instead.
-    html = f"""<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Payment Verified</title>
-  <style>
-    body {{ font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 0; background:#0b0f14; color:#e6edf3; }}
-    .wrap {{ max-width: 920px; margin: 40px auto; padding: 24px; }}
-    .card {{ background:#111827; border:1px solid #243040; border-radius: 14px; padding: 18px; }}
-    code, pre {{ background:#0b1220; border:1px solid #22314a; border-radius: 10px; padding: 10px; overflow:auto; color:#d1fae5; }}
-    .row {{ display:flex; gap:12px; flex-wrap:wrap; }}
-    .btn {{ background:#2563eb; border:none; color:white; padding:10px 14px; border-radius: 10px; cursor:pointer; font-weight:600; }}
-    .btn2 {{ background:#10b981; }}
-    .muted {{ color:#9ca3af; font-size: 13px; }}
-    input, textarea {{ width:100%; background:#0b1220; border:1px solid #22314a; color:#e6edf3; border-radius: 10px; padding:10px; }}
-    label {{ display:block; margin:10px 0 6px; font-weight:600; }}
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <h2>✅ Payment verified</h2>
-    <p class="muted">Token issued (TTL {PAID_TOKEN_TTL_SECONDS}s). This page stores it locally for calling <code>/analyze</code>.</p>
+    token_payload = {
+        "type": "paid_token",
+        "iat": iat,
+        "exp": exp,
+        "session_id": session_id,
+        "email": email,
+        "amount_total": amount_total,
+        "currency": currency,
+        "ttl_seconds": PAID_TOKEN_TTL_SECONDS,
+        "ver": app.version,
+    }
+    paid_token = jwt.encode(token_payload, TOKEN_SECRET, algorithm="HS256")
 
-    <div class="card">
-      <div class="row">
-        <div style="flex:1; min-width: 280px;">
-          <div><b>session_id</b></div>
-          <code>{rec.session_id}</code>
-        </div>
-        <div style="flex:1; min-width: 280px;">
-          <div><b>email</b></div>
-          <code>{rec.email or "-"}</code>
-        </div>
-      </div>
-
-      <label>Route</label>
-      <input id="route" value="Shanghai -> Tokyo" />
-
-      <label>Context</label>
-      <input id="context" value="Lithium battery materials, CIF" />
-
-      <label>Horizon days</label>
-      <input id="horizon" value="90" />
-
-      <label>Language (en/zh)</label>
-      <input id="lang" value="en" />
-
-      <div style="height:12px"></div>
-      <div class="row">
-        <button class="btn btn2" onclick="runAnalyze()">Run analyze now</button>
-        <button class="btn" onclick="copyToken()">Copy token</button>
-      </div>
-
-      <div style="height:12px"></div>
-      <div><b>Response</b></div>
-      <pre id="out">Ready.</pre>
-    </div>
-
-    <div style="height:16px"></div>
-    <div class="card">
-      <div><b>How to call with Hoppscotch / Postman</b></div>
-      <p class="muted">Set header <code>Authorization: Bearer &lt;token&gt;</code> (or just the token) and POST JSON to <code>/analyze</code>.</p>
-      <pre>POST {str(Request).split("'")[1] if False else ""}https://global-risk-api.onrender.com/analyze
-Content-Type: application/json
-Authorization: Bearer {rec.token}
-
-{{ "route":"Shanghai -> Tokyo", "context":"Lithium battery materials, CIF", "horizon_days":90, "language":"en" }}</pre>
-    </div>
-  </div>
-
-<script>
-  // Store token for later usage
-  const token = {json.dumps(rec.token)};
-  localStorage.setItem("SCRS_PAID_TOKEN", token);
-
-  function copyToken() {{
-    navigator.clipboard.writeText(token);
-    alert("Token copied.");
-  }}
-
-  async function runAnalyze() {{
-    const route = document.getElementById("route").value;
-    const context = document.getElementById("context").value;
-    const horizon_days = parseInt(document.getElementById("horizon").value || "90", 10);
-    const language = document.getElementById("lang").value || "en";
-
-    const payload = {{ route, context, horizon_days, language }};
-
-    document.getElementById("out").textContent = "Calling /analyze ...";
-    try {{
-      const resp = await fetch("/analyze", {{
-        method: "POST",
-        headers: {{
-          "Content-Type": "application/json",
-          "Authorization": "Bearer " + token
-        }},
-        body: JSON.stringify(payload)
-      }});
-      const txt = await resp.text();
-      document.getElementById("out").textContent = txt;
-    }} catch (e) {{
-      document.getElementById("out").textContent = "Error: " + (e && e.message ? e.message : String(e));
-    }}
-  }}
-
-  // Optional: auto-run
-  // runAnalyze();
-</script>
-</body>
-</html>
-"""
-    return HTMLResponse(content=html, status_code=200)
-
-
-@app.get("/cancel", response_class=HTMLResponse)
-def cancel() -> str:
-    return "<h3>Payment canceled.</h3>"
-
-
-@app.post("/create-checkout-session", response_class=JSONResponse)
-async def create_checkout_session(
-    request: Request,
-    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
-) -> dict:
-    """
-    OPTIONAL endpoint.
-    If you later want your own pay button from your landing page, call this to create a Stripe session.
-    Protected by X-API-Key (master key) to prevent abuse.
-    """
-    if not x_api_key or (API_KEYS and x_api_key.strip() not in API_KEYS):
-        raise HTTPException(status_code=401, detail="Unauthorized. Provide valid X-API-Key.")
-
-    if stripe is None:
-        raise HTTPException(status_code=500, detail="Stripe library not installed")
-
-    if not STRIPE_SECRET_KEY:
-        raise HTTPException(status_code=500, detail="STRIPE_SECRET_KEY not configured")
-
-    if not STRIPE_PRICE_ID:
-        raise HTTPException(status_code=500, detail="STRIPE_PRICE_ID not configured")
-
-    stripe.api_key = STRIPE_SECRET_KEY
-
-    body = await request.json()
-    # allow override quantity (default 1)
-    qty = int(body.get("quantity") or 1)
-    qty = max(1, min(10, qty))
-
-    try:
-        session = stripe.checkout.Session.create(
-            mode="payment",
-            line_items=[{"price": STRIPE_PRICE_ID, "quantity": qty}],
-            success_url=SUCCESS_URL,
-            cancel_url=CANCEL_URL,
-        )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Stripe error: {str(e)}")
-
+    # 你现在为了调试方便，返回 JSON；后面你可以改成返回 HTML 页面并存 localStorage
     return {
         "status": "ok",
-        "checkout_url": session.url,
-        "session_id": session.id,
+        "version": app.version,
+        "message": "Payment verified. Use this token to call /analyze with Authorization: Bearer <token>",
+        "token": paid_token,
+        "session_id": session_id,
+        "email": email,
+        "amount_total": amount_total,
+        "currency": currency,
+        "ttl_seconds": PAID_TOKEN_TTL_SECONDS,
     }
 
 
-# =========================
-# Global error handler (optional)
-# =========================
+@app.get("/__stripe")
+def stripe_debug(
+    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+):
+    """
+    Debug endpoint to confirm which Stripe account this service is using.
+    MUST be authenticated (same auth as /analyze).
+    """
+    # require auth to avoid leaking account info
+    _ = require_auth(authorization, x_api_key)
 
-@app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception):
-    # Avoid leaking secrets; keep it tight.
-    return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=500, detail="Stripe is not configured (missing STRIPE_SECRET_KEY).")
+
+    try:
+        acct = stripe.Account.retrieve()
+        # acct has 'id' and 'livemode'
+        return {
+            "ok": True,
+            "account_id": acct.get("id"),
+            "livemode": acct.get("livemode", False),
+            "key_prefix": "sk_live" if STRIPE_SECRET_KEY.startswith("sk_live") else "sk_test",
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Stripe error: {str(e)}")
 
 
-# Note: Render uses `uvicorn app:app ...` so no __main__ needed.
+@app.post("/analyze", response_model=AnalyzeResponse)
+def analyze(
+    payload: AnalyzeRequest,
+    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+):
+    """
+    Main API: requires auth (X-API-Key or Bearer).
+    """
+    auth_info = require_auth(authorization, x_api_key)
+    mode = auth_info["mode"]
+
+    # TODO: 这里你后面会接真实 risk pipeline / LLM / web search 等
+    # 我先用一个稳定的 mock 输出结构，保证前端/调用方不崩。
+    key_risks = [
+        {"name": "Geopolitical Tensions", "likelihood_0_1": 0.7, "impact_0_10": 8, "notes": "Potential policy shocks / trade friction."},
+        {"name": "Regulatory Changes", "likelihood_0_1": 0.6, "impact_0_10": 7, "notes": "Import/export controls and compliance updates."},
+        {"name": "Supply Disruptions", "likelihood_0_1": 0.5, "impact_0_10": 6, "notes": "Carrier capacity, port congestion, upstream shortages."},
+    ]
+
+    summary = (
+        f"The supply chain for {payload.context} on route {payload.route} faces multiple risks over {payload.horizon_days} days. "
+        "Key risks include geopolitics, regulation, and supply disruptions."
+    )
+    if payload.language == "zh":
+        summary = (
+            f"{payload.context} 在 {payload.route} 路线、未来 {payload.horizon_days} 天存在多维风险。"
+            "核心风险包括地缘政治、监管变化与供应中断。"
+        )
+
+    result = {
+        "summary": summary,
+        "horizon_days": payload.horizon_days,
+        "key_risks": key_risks,
+    }
+
+    return {
+        "status": "ok",
+        "version": app.version,
+        "mode": mode,
+        "result": result,
+    }
