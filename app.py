@@ -4,12 +4,11 @@ import json
 import secrets
 from typing import Optional, Dict, Any, List
 
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 import stripe
-import jwt
 from openai import OpenAI
 
 
@@ -21,17 +20,23 @@ def _get_env(name: str, default: Optional[str] = None) -> str:
     v = os.getenv(name, default)
     return v if v is not None else (default or "")
 
+
 def _get_bool(name: str, default: bool = False) -> bool:
     v = os.getenv(name)
     if v is None:
         return default
     return v.strip().lower() in ("1", "true", "yes", "y", "on")
 
+
 def _split_keys(v: str) -> List[str]:
     if not v:
         return []
     raw = v.replace("\n", ",").replace(" ", ",")
     return [x.strip() for x in raw.split(",") if x.strip()]
+
+
+def _now() -> int:
+    return int(time.time())
 
 
 # =========================
@@ -79,7 +84,7 @@ app = FastAPI(title=APP_NAME, version="0.5.0-scrs-llm")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # MVP 阶段先放开
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -105,14 +110,10 @@ class AnalyzeResponse(BaseModel):
 
 
 # =========================
-# Token storage (opaque token)
+# Token storage
 # =========================
 
 _issued_tokens: Dict[str, Dict[str, Any]] = {}
-
-
-def _now() -> int:
-    return int(time.time())
 
 
 def issue_token(session_id: str, email: str, amount_total: int, currency: str) -> str:
