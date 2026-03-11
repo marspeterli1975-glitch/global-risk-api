@@ -7,6 +7,46 @@ from typing import Optional, Dict, Any, List
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+class SCRSRequest(BaseModel):
+
+    origin_country: str = Field(..., description="Country where shipment originates")
+
+    destination_country: str = Field(..., description="Destination country")
+
+    supplier_years: int | None = Field(
+        default=None,
+        description="Years supplier has been operating"
+    )
+
+    supplier_financial_level: str | None = Field(
+        default="unknown",
+        description="Supplier financial stability: strong / adequate / weak / distressed / unknown"
+    )
+
+    supplier_dependency_pct: int | None = Field(
+        default=None,
+        description="Buyer dependency percentage on supplier"
+    )
+
+    transport_mode: str = Field(
+        ...,
+        description="Transport mode: sea / air / rail / road / multimodal"
+    )
+
+    route_region: str = Field(
+        ...,
+        description="Shipping route region"
+    )
+
+    product_type: str = Field(
+        ...,
+        description="Product category"
+    )
+
+    payment_terms: str = Field(
+        ...,
+        description="Payment terms"
+    )
 
 import stripe
 from openai import OpenAI
