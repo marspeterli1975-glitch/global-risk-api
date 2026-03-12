@@ -4,18 +4,19 @@ import json
 import hmac
 import hashlib
 import secrets
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Literal
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field
 
 
 # =====================================================
 # Basic App
 # =====================================================
-APP_VERSION = "0.6.1-scrs-api-output"
+APP_VERSION = "0.6.2-scrs-validation"
 APP_SECRET = os.getenv("APP_SECRET", "change-this-in-render-env")
 
 app = FastAPI(title="SCRS API", version=APP_VERSION)
@@ -36,6 +37,63 @@ app.add_middleware(
 # On redeploy/restart, tokens will reset.
 # =====================================================
 ISSUED_TOKENS: Dict[str, Dict[str, Any]] = {}
+
+
+# =====================================================
+# Error Handlers
+# =====================================================
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    field_errors = []
+
+    for err in exc.errors():
+        loc = err.get("loc", [])
+        field_name = loc[-1] if loc else "unknown"
+        message = err.get("msg", "Invalid input")
+        field_errors.append({
+            "field": str(field_name),
+            "message": message
+        })
+
+    return JSONResponse(
+        status_code=422,
+        content={
+            "error": "invalid_input",
+            "message": "Request validation failed",
+            "details": field_errors
+        }
+    )
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    error_name = "http_error"
+
+    if exc.status_code == 401:
+        error_name = "unauthorized"
+    elif exc.status_code == 404:
+        error_name = "not_found"
+    elif exc.status_code == 422:
+        error_name = "invalid_input"
+
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": error_name,
+            "message": exc.detail
+        }
+    )
+
+
+@app.exception_handler(Exception)
+async def generic_exception_handler(request: Request, exc: Exception):
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": "internal_error",
+            "message": "An unexpected server error occurred"
+        }
+    )
 
 
 # =====================================================
@@ -87,8 +145,8 @@ def clamp_score(value: float) -> float:
 # Request Model
 # =====================================================
 class SCRSRequest(BaseModel):
-    origin_country: str = Field(..., description="Country where shipment originates")
-    destination_country: str = Field(..., description="Destination country")
+    origin_country: str = Field(..., min_length=2, description="Country where shipment originates")
+    destination_country: str = Field(..., min_length=2, description="Destination country")
 
     supplier_years: Optional[int] = Field(
         default=None,
@@ -97,9 +155,11 @@ class SCRSRequest(BaseModel):
         description="Years supplier has been operating"
     )
 
-    supplier_financial_level: Optional[str] = Field(
+    supplier_financial_level: Optional[
+        Literal["strong", "adequate", "weak", "distressed", "unknown"]
+    ] = Field(
         default="unknown",
-        description="Supplier financial stability: strong / adequate / weak / distressed / unknown"
+        description="Supplier financial stability"
     )
 
     supplier_dependency_pct: Optional[int] = Field(
@@ -109,22 +169,53 @@ class SCRSRequest(BaseModel):
         description="Buyer dependency percentage on supplier"
     )
 
-    transport_mode: str = Field(
+    transport_mode: Literal["sea", "air", "rail", "road", "multimodal"] = Field(
         ...,
-        description="Transport mode: sea / air / rail / road / multimodal"
+        description="Transport mode"
     )
 
-    route_region: str = Field(
+    route_region: Literal[
+        "intra_asia",
+        "asia_europe",
+        "transpacific",
+        "middle_east_corridor",
+        "red_sea",
+        "black_sea",
+        "indian_ocean",
+        "south_asia",
+        "domestic_cross_border",
+        "other"
+    ] = Field(
         ...,
         description="Shipping route region"
     )
 
-    product_type: str = Field(
+    product_type: Literal[
+        "general_goods",
+        "consumer_goods",
+        "industrial_parts",
+        "machinery",
+        "metals_minerals",
+        "battery_materials",
+        "chemicals",
+        "temperature_sensitive",
+        "dangerous_goods",
+        "other"
+    ] = Field(
         ...,
         description="Product category"
     )
 
-    payment_terms: str = Field(
+    payment_terms: Literal[
+        "confirmed_lc",
+        "lc",
+        "tt_advance",
+        "tt_partial_balance_bl",
+        "oa_30",
+        "oa_60",
+        "consignment",
+        "other"
+    ] = Field(
         ...,
         description="Payment terms"
     )
