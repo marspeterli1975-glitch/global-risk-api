@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field
 # =====================================================
 # Basic App
 # =====================================================
-APP_VERSION = "0.6.0-scrs-scoring"
+APP_VERSION = "0.6.1-scrs-api-output"
 APP_SECRET = os.getenv("APP_SECRET", "change-this-in-render-env")
 
 app = FastAPI(title="SCRS API", version=APP_VERSION)
@@ -177,7 +177,6 @@ def score_supplier(data: SCRSRequest) -> Dict[str, Any]:
     financial_score = map_supplier_financial_to_score(data.supplier_financial_level)
     dependency_score = map_supplier_dependency_to_score(data.supplier_dependency_pct)
 
-    # MVP: delivery / quality unavailable, use neutral placeholders
     delivery_score = 50.0
     quality_score = 50.0
 
@@ -548,19 +547,9 @@ async def success(session_id: Optional[str] = None):
 
 @app.post("/analyze")
 async def analyze(data: SCRSRequest, authorization: Optional[str] = Header(default=None)):
-    token = verify_bearer_token(authorization)
+    verify_bearer_token(authorization)
     result = calculate_scrs(data)
-
-    response = {
-        "status": "success",
-        "version": APP_VERSION,
-        "authorized": True,
-        "token_preview": token[:12] + "...",
-        "input_received": data.dict(),
-        "result": result
-    }
-
-    return JSONResponse(content=response)
+    return JSONResponse(content=result)
 
 
 @app.get("/")
