@@ -576,19 +576,25 @@ async def checkout(req: CheckoutRequest, request: Request):
     if scan.get("paid"):
         raise HTTPException(status_code=400, detail="Session already paid")
 
+    # 把内部 session_id 传回前端 success 页面
+    separator = "&" if "?" in SUCCESS_URL else "?"
+    success_url = f"{SUCCESS_URL}{separator}session_id={req.session_id}"
+
     session = stripe.checkout.Session.create(
         mode="payment",
-        success_url=SUCCESS_URL,
+        success_url=success_url,
         cancel_url=CANCEL_URL,
         customer_email=scan["email"],
         line_items=[
             {
                 "price_data": {
                     "currency": req.currency.lower(),
-                    "product_data": {"name": "RiskAtlas Exposure Report"},
+                    "product_data": {
+                        "name": req.product_name,
+                    },
                     "unit_amount": req.amount_cents,
                 },
-                "quantity": 1
+                "quantity": 1,
             }
         ],
         metadata={
@@ -596,15 +602,17 @@ async def checkout(req: CheckoutRequest, request: Request):
             "company_name": scan["company_name"],
             "country": scan["country"],
             "industry": scan["industry"],
-        }
+        },
     )
 
     scan["checkout_session_id"] = session.id
+    scan["payment_status"] = "checkout_created"
 
     return {
         "checkout_url": session.url,
         "checkout_session_id": session.id,
-        "payment_status": "checkout_created"
+        "payment_status": "checkout_created",
+        "success_url": success_url
     }
 
 
