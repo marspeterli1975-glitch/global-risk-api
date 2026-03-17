@@ -1,3 +1,7 @@
+import pandas as pd
+import io
+import math
+from fastapi import UploadFile, File
 import os
 import time
 import json
@@ -60,6 +64,67 @@ app = FastAPI(
     debug=DEBUG,
 )
 
+# =========================
+# Load Planning Upload API
+# =========================
+
+@app.post("/load-planning/upload")
+async def load_planning_upload(file: UploadFile = File(...)):
+    filename = (file.filename or "").lower()
+
+    if not filename.endswith(".csv"):
+        return {"success": False, "error": "Only CSV supported"}
+
+    content = await file.read()
+
+    try:
+        df = pd.read_csv(io.BytesIO(content))
+    except Exception as e:
+        return {"success": False, "error": f"CSV parse error: {str(e)}"}
+
+    results = []
+
+    for _, row in df.iterrows():
+        try:
+            length = float(row["Max Outer Length (mm)"])
+            width = float(row["Max Outer Width (mm)"])
+            height = float(row["Max Outer Height (mm)"])
+            weight = float(row["Gross Weight per Unit (kg)"])
+            qty = int(row["Quantity"])
+            stack = int(row["Max Stack Layers"])
+
+            volume_per_unit = (length * width * height) / 1_000_000_000
+            total_volume = volume_per_unit * qty
+            total_weight = weight * qty
+
+            # 简化算法（第一版）
+            units_per_40hq = int(
+                (12032 // length) *
+                (2352 // width) *
+                min(stack, int(2698 // height))
+            )
+
+            container_count = math.ceil(qty / units_per_40hq) if units_per_40hq > 0 else 0
+
+            results.append({
+                "product_name": row["Product Name"],
+                "hs_code": row.get("Suggested HS Code", ""),
+                "units_per_container": units_per_40hq,
+                "estimated_container_count": container_count,
+                "total_volume_m3": round(total_volume, 3),
+                "total_weight_kg": round(total_weight, 2)
+            })
+
+        except Exception as e:
+            results.append({
+                "error": str(e),
+                "row": dict(row)
+            })
+
+    return {
+        "success": True,
+        "results": results
+    }
 # -----------------------------
 # CORS
 # -----------------------------
