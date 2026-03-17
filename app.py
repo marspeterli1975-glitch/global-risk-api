@@ -70,12 +70,10 @@ app = FastAPI(
 
 @app.post("/load-planning/upload")
 async def load_planning_upload(file: UploadFile = File(...)):
-    filename = (file.filename or "").lower()
-
-    if not filename.endswith(".csv"):
-        return {"success": False, "error": "Only CSV supported"}
-
     content = await file.read()
+
+    if not content:
+        return {"success": False, "error": "Uploaded file is empty"}
 
     try:
         df = pd.read_csv(io.BytesIO(content))
