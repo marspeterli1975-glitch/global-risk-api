@@ -74,59 +74,98 @@ app = FastAPI(
 
 @app.post("/load-planning/upload")
 async def load_planning_upload(file: UploadFile = File(...)):
-    content = await file.read()
-
-    if not content:
-        return {"success": False, "error": "Uploaded file is empty"}
-
     try:
-        df = pd.read_csv(io.BytesIO(content))
-    except Exception as e:
-        return {"success": False, "error": f"CSV parse error: {str(e)}"}
+        filename = (file.filename or "").lower()
 
-    results = []
+        if not filename.endswith(".csv"):
+            return {
+                "success": False,
+                "error": "Only CSV supported"
+            }
 
-    for _, row in df.iterrows():
+        content = await file.read()
+
+        if not content:
+            return {
+                "success": False,
+                "error": "Uploaded file is empty"
+            }
+
         try:
-            length = float(row["Max Outer Length (mm)"])
-            width = float(row["Max Outer Width (mm)"])
-            height = float(row["Max Outer Height (mm)"])
-            weight = float(row["Gross Weight per Unit (kg)"])
-            qty = int(row["Quantity"])
-            stack = int(row["Max Stack Layers"])
+            decoded = content.decode("utf-8-sig")
+        except Exception:
+            decoded = content.decode("utf-8")
 
-            volume_per_unit = (length * width * height) / 1_000_000_000
-            total_volume = volume_per_unit * qty
-            total_weight = weight * qty
-
-            # 简化算法（第一版）
-            units_per_40hq = int(
-                (12032 // length) *
-                (2352 // width) *
-                min(stack, int(2698 // height))
-            )
-
-            container_count = math.ceil(qty / units_per_40hq) if units_per_40hq > 0 else 0
-
-            results.append({
-                "product_name": row["Product Name"],
-                "hs_code": row.get("Suggested HS Code", ""),
-                "units_per_container": units_per_40hq,
-                "estimated_container_count": container_count,
-                "total_volume_m3": round(total_volume, 3),
-                "total_weight_kg": round(total_weight, 2)
-            })
-
+        try:
+            df_reader = csv.DictReader(io.StringIO(decoded))
+            rows = list(df_reader)
         except Exception as e:
-            results.append({
-                "error": str(e),
-                "row": dict(row)
-            })
+            return {
+                "success": False,
+                "error": f"CSV parse error: {str(e)}"
+            }
 
-    return {
-        "success": True,
-        "results": results
-    }
+        if not rows:
+            return {
+                "success": False,
+                "error": "CSV contains no data rows"
+            }
+
+        results = []
+
+        for idx, row in enumerate(rows, start=1):
+            try:
+                product_name = str(row.get("Product Name", "") or "").strip()
+                hs_code = str(row.get("Suggested HS Code", "") or "").strip()
+
+                length = float(row.get("Max Outer Length (mm)", 0) or 0)
+                width = float(row.get("Max Outer Width (mm)", 0) or 0)
+                height = float(row.get("Max Outer Height (mm)", 0) or 0)
+                weight = float(row.get("Gross Weight per Unit (kg)", 0) or 0)
+                qty = int(float(row.get("Quantity", 0) or 0))
+                stack = int(float(row.get("Max Stack Layers", 1) or 1))
+
+                if qty <= 0:
+                    continue
+
+                volume_per_unit = (length * width * height) / 1_000_000_000
+                total_volume = volume_per_unit * qty
+                total_weight = weight * qty
+
+                # V1 简化逻辑：先按一个基础柜型估算
+                # 后续可以换成真实 container template engine
+                units_per_container = 10
+                estimated_container_count = max(1, (qty + units_per_container - 1) // units_per_container)
+
+                results.append({
+                    "product_name": product_name or f"Line {idx}",
+                    "hs_code": hs_code,
+                    "units_per_container": units_per_container,
+                    "estimated_container_count": estimated_container_count,
+                    "total_volume_m3": round(total_volume, 3),
+                    "total_weight_kg": round(total_weight, 2),
+                })
+
+            except Exception as row_err:
+                results.append({
+                    "product_name": f"Line {idx}",
+                    "hs_code": "",
+                    "units_per_container": 0,
+                    "estimated_container_count": 0,
+                    "total_volume_m3": 0,
+                    "total_weight_kg": 0,
+                })
+
+        return {
+            "success": True,
+            "results": results
+        }
+
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
 # -----------------------------
 # CORS
 # -----------------------------
