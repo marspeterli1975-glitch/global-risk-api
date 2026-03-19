@@ -1,5 +1,6 @@
 import pandas as pd
 import io
+from typing import Any, Dict, List
 import math
 from fastapi import UploadFile, File
 import os
@@ -74,9 +75,311 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-# =========================
-# Load Planning Upload API
-# =========================
+# =========================================
+# Load Planning + Operational Risk Engine
+# =========================================
+
+CONTAINER_LIBRARY = {
+    "20GP": {
+        "volume_m3": 33.0,
+        "payload_kg": 28200,
+        "label": "20GP",
+    },
+    "40GP": {
+        "volume_m3": 67.0,
+        "payload_kg": 26700,
+        "label": "40GP",
+    },
+    "40HQ": {
+        "volume_m3": 76.0,
+        "payload_kg": 26500,
+        "label": "40HQ",
+    },
+}
+
+
+def safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def safe_int(value: Any, default: int = 0) -> int:
+    try:
+        if value is None or value == "":
+            return default
+        return int(float(value))
+    except Exception:
+        return default
+
+
+def normalize_yes_no(value: Any) -> bool:
+    text = str(value or "").strip().lower()
+    return text in {"yes", "y", "true", "1"}
+
+
+def pick_best_container(total_volume_m3: float, total_weight_kg: float) -> Dict[str, Any]:
+    candidates = []
+
+    for container_code, container in CONTAINER_LIBRARY.items():
+        volume_capacity = container["volume_m3"]
+        payload_capacity = container["payload_kg"]
+
+        volume_count = max(1, int(-(-total_volume_m3 // volume_capacity))) if volume_capacity > 0 else 999
+        weight_count = max(1, int(-(-total_weight_kg // payload_capacity))) if payload_capacity > 0 else 999
+        required_count = max(volume_count, weight_count)
+
+        volume_utilization = 0.0
+        weight_utilization = 0.0
+
+        if required_count > 0:
+            volume_utilization = total_volume_m3 / (required_count * volume_capacity)
+            weight_utilization = total_weight_kg / (required_count * payload_capacity)
+
+        candidates.append({
+            "container_type": container_code,
+            "container_label": container["label"],
+            "container_volume_m3": volume_capacity,
+            "container_payload_kg": payload_capacity,
+            "estimated_container_count": required_count,
+            "volume_utilization": round(volume_utilization, 3),
+            "weight_utilization": round(weight_utilization, 3),
+        })
+
+    # 优先柜数少，其次利用率更平衡
+    candidates.sort(
+        key=lambda x: (
+            x["estimated_container_count"],
+            abs(0.72 - x["volume_utilization"]),
+            abs(0.72 - x["weight_utilization"]),
+        )
+    )
+    return candidates[0]
+
+
+def evaluate_operational_risk(
+    total_volume_m3: float,
+    total_weight_kg: float,
+    estimated_container_count: int,
+    volume_utilization: float,
+    weight_utilization: float,
+    max_stack_layers: int,
+    rotatable: bool,
+    invertible: bool,
+    allow_mixed_load: bool,
+    cargo_form: str,
+    preferred_container: str = "",
+    only_china_vi: bool = False,
+    height_restriction_alert: bool = False,
+    weight_restriction_alert: bool = False,
+    appointment_required: bool = False,
+    closed_body_preferred: bool = False,
+) -> Dict[str, Any]:
+    score = 0
+    flags: List[str] = []
+    notes: List[str] = []
+    actions: List[str] = []
+
+    # 1. 重量风险
+    if total_weight_kg >= 26000:
+        score += 30
+        flags.append("overweight_risk")
+        notes.append("Total shipment weight is beyond or very close to standard container payload ceiling.")
+        actions.append("Split shipment into more containers or switch to a lighter batch structure.")
+    elif total_weight_kg >= 22000:
+        score += 18
+        flags.append("weight_limit_close")
+        notes.append("Shipment weight is close to a common payload red line.")
+        actions.append("Recheck container payload by selected type and destination handling conditions.")
+
+    # 2. 体积利用率风险
+    if volume_utilization < 0.30:
+        score += 12
+        flags.append("low_utilization")
+        notes.append("Container volume utilization is low, indicating cost inefficiency.")
+        actions.append("Consider combining shipments or switching to a smaller container type.")
+    elif volume_utilization > 0.92:
+        score += 14
+        flags.append("high_density_loading")
+        notes.append("Container volume utilization is very high and leaves little execution buffer.")
+        actions.append("Review placement margin, handling tolerance, and loading feasibility.")
+
+    # 3. 重量利用率风险
+    if weight_utilization > 0.90:
+        score += 15
+        flags.append("payload_stress")
+        notes.append("Payload utilization is high and may amplify operational fragility.")
+        actions.append("Add execution buffer or split the shipment to reduce payload concentration.")
+
+    # 4. 多柜复杂度
+    if estimated_container_count >= 4:
+        score += 12
+        flags.append("multi_container_complexity")
+        notes.append("Multi-container execution increases coordination complexity.")
+        actions.append("Confirm booking, loading sequence, and destination receiving arrangement.")
+    elif estimated_container_count >= 2:
+        score += 6
+        flags.append("multi_container_execution")
+        notes.append("More than one container is required, increasing execution steps.")
+
+    # 5. 堆叠与形态
+    if max_stack_layers <= 1:
+        score += 12
+        flags.append("stacking_limited")
+        notes.append("Non-stackable or low-stack cargo reduces loading flexibility.")
+        actions.append("Review cargo support structure or batch split strategy.")
+    elif max_stack_layers == 2:
+        score += 6
+        flags.append("stacking_constrained")
+        notes.append("Stacking limit may reduce achievable loading efficiency.")
+
+    if cargo_form == "liquid":
+        score += 10
+        flags.append("liquid_handling_attention")
+        notes.append("Liquid cargo usually requires additional handling control.")
+    elif cargo_form == "powder":
+        score += 8
+        flags.append("powder_handling_attention")
+        notes.append("Powder cargo may have handling and cleanliness sensitivity.")
+
+    if not rotatable:
+        score += 5
+        flags.append("rotation_not_allowed")
+        notes.append("Orientation flexibility is limited because rotation is not allowed.")
+
+    if not invertible:
+        score += 5
+        flags.append("inversion_not_allowed")
+        notes.append("Vertical inversion is not allowed, reducing loading flexibility.")
+
+    if not allow_mixed_load:
+        score += 4
+        flags.append("dedicated_space_preferred")
+        notes.append("Mixed loading is not allowed, which can reduce consolidation flexibility.")
+
+    # 6. 目的地执行限制
+    if only_china_vi:
+        score += 5
+        flags.append("china_vi_constraint")
+        notes.append("Destination requires China VI-compliant inland vehicle arrangement.")
+        actions.append("Confirm local truck compliance before dispatch.")
+
+    if height_restriction_alert:
+        score += 8
+        flags.append("height_restriction_alert")
+        notes.append("Destination or route may contain height restriction concerns.")
+        actions.append("Verify total loaded height and route entry conditions.")
+
+    if weight_restriction_alert:
+        score += 8
+        flags.append("weight_restriction_alert")
+        notes.append("Destination or route may contain weight restriction concerns.")
+        actions.append("Verify axle/load restrictions and receiving site access conditions.")
+
+    if appointment_required:
+        score += 6
+        flags.append("appointment_required")
+        notes.append("Delivery requires appointment coordination.")
+        actions.append("Book receiving window early to avoid demurrage or waiting time.")
+
+    if closed_body_preferred:
+        score += 6
+        flags.append("closed_body_preferred")
+        notes.append("Closed-body transport is preferred for destination handling.")
+        actions.append("Avoid open-body truck if cargo sensitivity or site rule applies.")
+
+    # 7. 偏好柜型不匹配
+    if preferred_container and preferred_container in CONTAINER_LIBRARY:
+        best = pick_best_container(total_volume_m3, total_weight_kg)
+        if preferred_container != best["container_type"]:
+            score += 8
+            flags.append("preferred_container_mismatch")
+            notes.append("Preferred container is not aligned with current shipment structure.")
+            actions.append(f"Reconsider preferred container. Current best-fit estimate is {best['container_type']}.")
+
+    score = min(score, 100)
+
+    if score >= 65:
+        level = "High"
+    elif score >= 35:
+        level = "Medium"
+    else:
+        level = "Low"
+
+    if actions:
+        dedup_actions = list(dict.fromkeys(actions))
+    else:
+        dedup_actions = ["Proceed with booking after basic verification."]
+
+    return {
+        "operational_risk_score": score,
+        "operational_risk_level": level,
+        "risk_flags": flags,
+        "risk_notes": notes,
+        "recommended_actions": dedup_actions,
+    }
+
+
+def calculate_macro_risk(row: Dict[str, Any], op_risk_score: int) -> Dict[str, Any]:
+    """
+    V1 先做一个简化版 RiskAtlas 合并层：
+    - 不引入国家/港口实时数据
+    - 基于货物形态、执行限制、复杂度，形成 Macro/Execution 代理分
+    后续可以再接你原来的 RiskAtlas 真正评分引擎。
+    """
+    macro_score = 22
+    execution_score = 18
+
+    cargo_form = str(row.get("Cargo Form", "") or "").strip().lower()
+    qty = safe_int(row.get("Quantity", 0), 0)
+    note_text = str(row.get("Note", "") or "").strip()
+
+    if cargo_form == "liquid":
+        macro_score += 8
+        execution_score += 8
+    elif cargo_form == "powder":
+        macro_score += 6
+        execution_score += 6
+
+    if qty >= 100:
+        execution_score += 10
+    elif qty >= 30:
+        execution_score += 5
+
+    if normalize_yes_no(row.get("Appointment Required", "no")):
+        execution_score += 8
+
+    if normalize_yes_no(row.get("Height Restriction Alert", "no")):
+        execution_score += 8
+
+    if normalize_yes_no(row.get("Weight Restriction Alert", "no")):
+        execution_score += 8
+
+    if note_text:
+        execution_score += 4
+
+    macro_score = min(macro_score, 100)
+    execution_score = min(execution_score, 100)
+
+    final_score = round((macro_score * 0.40) + (op_risk_score * 0.30) + (execution_score * 0.30))
+
+    if final_score >= 75:
+        final_level = "High"
+    elif final_score >= 45:
+        final_level = "Medium"
+    else:
+        final_level = "Low"
+
+    return {
+        "macro_risk_score": macro_score,
+        "execution_risk_score": execution_score,
+        "final_riskatlas_score": final_score,
+        "final_riskatlas_level": final_level,
+    }
+
 
 @app.post("/load-planning/upload")
 async def load_planning_upload(file: UploadFile = File(...)):
@@ -103,8 +406,8 @@ async def load_planning_upload(file: UploadFile = File(...)):
             decoded = content.decode("utf-8")
 
         try:
-            df_reader = csv.DictReader(io.StringIO(decoded))
-            rows = list(df_reader)
+            reader = csv.DictReader(io.StringIO(decoded))
+            rows = list(reader)
         except Exception as e:
             return {
                 "success": False,
@@ -124,12 +427,24 @@ async def load_planning_upload(file: UploadFile = File(...)):
                 product_name = str(row.get("Product Name", "") or "").strip()
                 hs_code = str(row.get("Suggested HS Code", "") or "").strip()
 
-                length = float(row.get("Max Outer Length (mm)", 0) or 0)
-                width = float(row.get("Max Outer Width (mm)", 0) or 0)
-                height = float(row.get("Max Outer Height (mm)", 0) or 0)
-                weight = float(row.get("Gross Weight per Unit (kg)", 0) or 0)
-                qty = int(float(row.get("Quantity", 0) or 0))
-                stack = int(float(row.get("Max Stack Layers", 1) or 1))
+                length = safe_float(row.get("Max Outer Length (mm)", 0), 0)
+                width = safe_float(row.get("Max Outer Width (mm)", 0), 0)
+                height = safe_float(row.get("Max Outer Height (mm)", 0), 0)
+                weight = safe_float(row.get("Gross Weight per Unit (kg)", 0), 0)
+                qty = safe_int(row.get("Quantity", 0), 0)
+                stack = safe_int(row.get("Max Stack Layers", 1), 1)
+
+                cargo_form = str(row.get("Cargo Form", "solid") or "solid").strip().lower()
+                rotatable = normalize_yes_no(row.get("Rotatable", "yes"))
+                invertible = normalize_yes_no(row.get("Invertible", "no"))
+                allow_mixed_load = normalize_yes_no(row.get("Allow Mixed Load", "yes"))
+
+                preferred_container = str(row.get("Preferred Container", "") or "").strip()
+                only_china_vi = normalize_yes_no(row.get("Only China VI", "no"))
+                height_restriction_alert = normalize_yes_no(row.get("Height Restriction Alert", "no"))
+                weight_restriction_alert = normalize_yes_no(row.get("Weight Restriction Alert", "no"))
+                appointment_required = normalize_yes_no(row.get("Appointment Required", "no"))
+                closed_body_preferred = normalize_yes_no(row.get("Closed Body Preferred", "no"))
 
                 if qty <= 0:
                     continue
@@ -138,18 +453,55 @@ async def load_planning_upload(file: UploadFile = File(...)):
                 total_volume = volume_per_unit * qty
                 total_weight = weight * qty
 
-                # V1 简化逻辑：先按一个基础柜型估算
-                # 后续可以换成真实 container template engine
-                units_per_container = 10
-                estimated_container_count = max(1, (qty + units_per_container - 1) // units_per_container)
+                best_container = pick_best_container(total_volume, total_weight)
+
+                op_risk = evaluate_operational_risk(
+                    total_volume_m3=total_volume,
+                    total_weight_kg=total_weight,
+                    estimated_container_count=best_container["estimated_container_count"],
+                    volume_utilization=best_container["volume_utilization"],
+                    weight_utilization=best_container["weight_utilization"],
+                    max_stack_layers=stack,
+                    rotatable=rotatable,
+                    invertible=invertible,
+                    allow_mixed_load=allow_mixed_load,
+                    cargo_form=cargo_form,
+                    preferred_container=preferred_container,
+                    only_china_vi=only_china_vi,
+                    height_restriction_alert=height_restriction_alert,
+                    weight_restriction_alert=weight_restriction_alert,
+                    appointment_required=appointment_required,
+                    closed_body_preferred=closed_body_preferred,
+                )
+
+                riskatlas = calculate_macro_risk(row, op_risk["operational_risk_score"])
+
+                planning_insight = {
+                    "recommended_container": best_container["container_type"],
+                    "estimated_container_count": best_container["estimated_container_count"],
+                    "volume_utilization": best_container["volume_utilization"],
+                    "weight_utilization": best_container["weight_utilization"],
+                    "efficiency_band": (
+                        "High" if best_container["volume_utilization"] >= 0.75
+                        else "Medium" if best_container["volume_utilization"] >= 0.45
+                        else "Low"
+                    ),
+                }
 
                 results.append({
                     "product_name": product_name or f"Line {idx}",
                     "hs_code": hs_code,
-                    "units_per_container": units_per_container,
-                    "estimated_container_count": estimated_container_count,
+                    "units_per_container": max(
+                        1,
+                        int(qty / best_container["estimated_container_count"])
+                    ),
+                    "estimated_container_count": best_container["estimated_container_count"],
                     "total_volume_m3": round(total_volume, 3),
                     "total_weight_kg": round(total_weight, 2),
+
+                    "planning_insight": planning_insight,
+                    "operational_risk": op_risk,
+                    "riskatlas": riskatlas,
                 })
 
             except Exception as row_err:
@@ -160,6 +512,26 @@ async def load_planning_upload(file: UploadFile = File(...)):
                     "estimated_container_count": 0,
                     "total_volume_m3": 0,
                     "total_weight_kg": 0,
+                    "planning_insight": {
+                        "recommended_container": "N/A",
+                        "estimated_container_count": 0,
+                        "volume_utilization": 0,
+                        "weight_utilization": 0,
+                        "efficiency_band": "N/A",
+                    },
+                    "operational_risk": {
+                        "operational_risk_score": 0,
+                        "operational_risk_level": "N/A",
+                        "risk_flags": [f"row_parse_error_{idx}"],
+                        "risk_notes": [str(row_err)],
+                        "recommended_actions": ["Check CSV row structure and numeric fields."],
+                    },
+                    "riskatlas": {
+                        "macro_risk_score": 0,
+                        "execution_risk_score": 0,
+                        "final_riskatlas_score": 0,
+                        "final_riskatlas_level": "N/A",
+                    },
                 })
 
         return {
@@ -172,6 +544,52 @@ async def load_planning_upload(file: UploadFile = File(...)):
             "success": False,
             "error": str(e)
         }
+
+
+@app.post("/load-planning/run-riskatlas")
+async def run_load_planning_riskatlas(file: UploadFile = File(...)):
+    """
+    给前端一个明确的‘Run Full RiskAtlas Analysis’入口。
+    当前 V1 先复用 upload 结果并突出 RiskAtlas 合并层输出。
+    """
+    upload_result = await load_planning_upload(file)
+
+    if not upload_result.get("success"):
+        return upload_result
+
+    results = upload_result.get("results", [])
+
+    portfolio_summary = {
+        "line_count": len(results),
+        "total_operational_risk_score": 0,
+        "total_final_riskatlas_score": 0,
+        "highest_risk_line": "",
+        "overall_level": "Low",
+    }
+
+    if results:
+        op_scores = [r["operational_risk"]["operational_risk_score"] for r in results]
+        final_scores = [r["riskatlas"]["final_riskatlas_score"] for r in results]
+
+        portfolio_summary["total_operational_risk_score"] = round(sum(op_scores) / len(op_scores))
+        portfolio_summary["total_final_riskatlas_score"] = round(sum(final_scores) / len(final_scores))
+
+        highest_idx = final_scores.index(max(final_scores))
+        portfolio_summary["highest_risk_line"] = results[highest_idx]["product_name"]
+
+        avg_final = portfolio_summary["total_final_riskatlas_score"]
+        if avg_final >= 75:
+            portfolio_summary["overall_level"] = "High"
+        elif avg_final >= 45:
+            portfolio_summary["overall_level"] = "Medium"
+        else:
+            portfolio_summary["overall_level"] = "Low"
+
+    return {
+        "success": True,
+        "summary": portfolio_summary,
+        "results": results
+    }
 # -----------------------------
 # CORS
 # -----------------------------
